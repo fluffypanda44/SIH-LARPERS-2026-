@@ -1,15 +1,11 @@
 """
-Autonomous Ground Vehicle (UGV) Real-World Traversability Perception Engine.
+Autonomous Ground Vehicle (UGV) Real-World Traversability & Stairway Perception Engine.
 Hardware-Accelerated on NVIDIA GeForce RTX 4050 Laptop GPU via ONNX DirectML.
 
-Supports:
-- Local Webcams (USB / Integrated HD)
-- Wireless Mobile Phone Streaming (IP Webcam, DroidCam, RTSP) with Zero-Lag Threaded Buffer
-- Recorded MP4 Videos
-
-Authentic Real-World Semantic Output:
-- 3D PERSPECTIVE NEON GREEN GROUND GRID on Traversable Ground (Floors, Walkways, Roads)
-- RED (Lethal Obstacles): Walls, Desks, Chairs, Furniture, Persons, Obstacles
+Clean semantic scene understanding (zero fake grids or synthetic artifacts):
+- GREEN (Traversable): Floors, Ground, Roads, Sidewalks, Grass, Carpets, Dirt paths
+- CYAN (Stairway): Steps, Staircases, Inclines (Navigation Incline Corridor)
+- RED (Lethal Obstacles): Walls, Columns, Desks, Chairs, Furniture, Persons
 - ORANGE (Hazards): Water, Pits, Drop-offs
 - GRAY (Background): Ceiling, Sky
 """
@@ -38,10 +34,13 @@ TRAVERSABLE_ADE_IDS = {
     29,  # field
     46,  # sand
     52,  # path
-    54,  # runway
-    59,  # step, stair
     91,  # dirt track
     94,  # land, ground
+}
+
+STAIRWAY_ADE_IDS = {
+    54,  # staircase, stairway
+    59,  # step, stair
 }
 
 HAZARD_ADE_IDS = {
@@ -59,55 +58,22 @@ BACKGROUND_ADE_IDS = {
 
 # Color palette (BGR for OpenCV)
 COLOR_PALETTE = np.array([
-    [70, 70, 70],     # 0: Gray (Ceiling / Sky)
-    [34, 180, 34],    # 1: Green (Traversable Ground)
-    [40, 40, 220],    # 2: Red (Lethal Obstacles)
-    [0, 140, 255],    # 3: Orange (Hazards / Water)
+    [70, 70, 70],      # 0: Gray (Ceiling / Sky)
+    [34, 180, 34],     # 1: Green (Traversable Ground / Walkway)
+    [40, 40, 220],     # 2: Red (Lethal Obstacles)
+    [0, 140, 255],     # 3: Orange (Hazards / Water)
+    [255, 200, 0],     # 4: Electric Cyan (Stairways / Steps / Inclines)
 ], dtype=np.uint8)
 
-# Nav2 Metric Costmap palette: 0 = Free, 254 = Lethal, 250 = Hazard
-COSTMAP_LUT = np.array([0, 0, 254, 250], dtype=np.uint8)
-
-
-class PerspectiveGridEngine:
-    """Renders a true 3D spatial perspective grid radiating from camera horizon."""
-
-    def __init__(self):
-        self.cached_grid = None
-        self.last_shape = None
-
-    def get_grid(self, h: int, w: int) -> np.ndarray:
-        if self.cached_grid is not None and self.last_shape == (h, w):
-            return self.cached_grid
-
-        grid = np.zeros((h, w, 3), dtype=np.uint8)
-        xv = w // 2
-        yv = int(h * 0.35)
-
-        # 1. Perspective longitudinal rays radiating from vanishing point
-        rays = np.linspace(-int(0.35 * w), int(1.35 * w), 33, dtype=int)
-        for xb in rays:
-            cv2.line(grid, (xv, yv), (xb, h), (0, 255, 120), 1, cv2.LINE_AA)
-
-        # 2. Depth-foreshortened transverse crossbars (exponential spacing)
-        for k in range(1, 16):
-            ratio = (k / 15.0) ** 2.3
-            yk = int(yv + (h - yv) * ratio)
-            t = (yk - yv) / max(h - yv, 1)
-            xl = int(xv + (rays[0] - xv) * t)
-            xr = int(xv + (rays[-1] - xv) * t)
-            cv2.line(grid, (max(0, xl), yk), (min(w, xr), yk), (0, 255, 120), 1, cv2.LINE_AA)
-
-        self.cached_grid = grid
-        self.last_shape = (h, w)
-        return self.cached_grid
+# Nav2 Metric Costmap palette: 0 = Free, 80 = Stairs (incline), 254 = Lethal, 250 = Hazard
+COSTMAP_LUT = np.array([0, 0, 254, 250, 80], dtype=np.uint8)
 
 
 class ThreadedCamera:
-    """Zero-latency threaded stream reader for wireless phone IP cameras."""
+    """Low-latency threaded stream reader to eliminate network buffer bloat."""
 
     def __init__(self, src: str):
-        print(f"[STREAM] Connecting to stream: {src}")
+        print(f"[STREAM] Connecting to video stream: {src}")
         self.cap = cv2.VideoCapture(src)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
         self.lock = threading.Lock()
@@ -116,7 +82,7 @@ class ThreadedCamera:
         self.running = True
 
         if not self.cap.isOpened():
-            print(f"[ERROR] Could not open stream at: {src}")
+            print(f"[ERROR] Could not open video stream: {src}")
             self.running = False
             return
 
@@ -186,15 +152,16 @@ class UGVVisionEngine:
         self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(1, 1, 3)
         self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(1, 1, 3)
 
+        # Build fast 150-class lookup table
         self.ade_to_trav = np.full(150, 2, dtype=np.uint8)  # default: obstacle (2)
         for idx in TRAVERSABLE_ADE_IDS:
             self.ade_to_trav[idx] = 1
+        for idx in STAIRWAY_ADE_IDS:
+            self.ade_to_trav[idx] = 4  # Class 4: Stairway
         for idx in HAZARD_ADE_IDS:
             self.ade_to_trav[idx] = 3
         for idx in BACKGROUND_ADE_IDS:
             self.ade_to_trav[idx] = 0
-
-        self.grid_engine = PerspectiveGridEngine()
 
         # Warm up GPU
         print("Warming up GPU kernels...")
@@ -202,14 +169,13 @@ class UGVVisionEngine:
         self.session.run(["logits"], {"pixel_values": dummy})
         print("Perception pipeline fully armed.\n")
 
-    def infer(self, frame_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+    def infer(self, frame_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
         """
         Runs real-time inference on a BGR video frame.
         Returns:
             color_mask: (H, W, 3) uint8 BGR overlay
             costmap: (H, W) uint8 Nav2 costmap
             latency_ms: GPU inference time in ms
-            trav_mask: (H, W) raw 4-class mask
         """
         orig_h, orig_w = frame_bgr.shape[:2]
 
@@ -229,37 +195,11 @@ class UGVVisionEngine:
         color_mask = COLOR_PALETTE[trav_mask]
         costmap = COSTMAP_LUT[trav_mask]
 
-        return color_mask, costmap, t_gpu_infer, trav_mask
-
-    def render_perspective_overlay(
-        self,
-        frame: np.ndarray,
-        color_mask: np.ndarray,
-        trav_mask: np.ndarray,
-        alpha: float = 0.35,
-    ) -> np.ndarray:
-        """Overlays the 3D perspective neon grid strictly onto traversable ground."""
-        h, w = frame.shape[:2]
-
-        # Subtle base tint for obstacles and hazards
-        blended = cv2.addWeighted(color_mask, alpha * 0.4, frame, 1.0 - (alpha * 0.4), 0)
-
-        # Generate perspective grid
-        grid = self.grid_engine.get_grid(h, w)
-
-        # Mask grid to only appear on traversable ground (trav_mask == 1)
-        ground_mask = (trav_mask == 1).astype(np.uint8)
-        masked_grid = cv2.bitwise_and(grid, grid, mask=ground_mask)
-
-        # Add vibrant neon green perspective grid strictly on traversable floor
-        grid_overlay = cv2.addWeighted(blended, 0.20, masked_grid, 0.80, 0)
-        grid_mask_1ch = cv2.cvtColor(masked_grid, cv2.COLOR_BGR2GRAY)
-        np.copyto(blended, grid_overlay, where=(grid_mask_1ch > 0)[:, :, np.newaxis])
-        return blended
+        return color_mask, costmap, t_gpu_infer
 
 
-def run_pipeline(source=0, alpha: float = 0.40):
-    """Launches the real-time traversability perception feed with 3D perspective grid."""
+def run_pipeline(source=0, alpha: float = 0.35):
+    """Launches the clean, real-time traversability perception feed."""
     engine = UGVVisionEngine("segformer_b0.onnx")
 
     is_network_stream = isinstance(source, str) and (
@@ -286,52 +226,53 @@ def run_pipeline(source=0, alpha: float = 0.40):
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
     if not cap.isOpened():
-        print(f"\n[ERROR] Could not connect to source: {source}")
+        print(f"[ERROR] Could not connect to source: {source}")
         return
 
     fps_smooth = 30.0
     print("\n" + "=" * 65)
-    print(" LIVE STREAM ACTIVE [3D PERSPECTIVE GROUND GRID]")
-    print(f" Hardware Accelerator: {engine.device_name}")
-    print(" 🟩 GREEN GRID = Drivable Ground Perspective Mesh")
-    print(" 🟥 RED        = Lethal Obstacles")
+    print(" REAL-TIME TRAVERSABILITY ACTIVE")
+    print(f" Accelerator: {engine.device_name}")
+    print(" 🟩 GREEN  = Traversable Ground / Floor")
+    print(" 🟦 CYAN   = Stairway / Steps / Incline")
+    print(" 🟥 RED    = Obstacles (Walls, Furniture, Persons)")
+    print(" ⬛ GRAY   = Background / Ceiling")
     print(" Press 'q' key to stop.")
     print("=" * 65 + "\n")
 
     while cap.isOpened():
-        t0 = time.perf_counter()
+        t_frame_start = time.perf_counter()
         ret, frame = cap.read()
         if not ret or frame is None:
             time.sleep(0.01)
             continue
 
-        color_mask, costmap, gpu_latency, trav_mask = engine.infer(frame)
-        blended = engine.render_perspective_overlay(frame, color_mask, trav_mask, alpha=alpha)
+        color_mask, costmap, gpu_latency = engine.infer(frame)
 
-        dt = time.perf_counter() - t0
-        curr_fps = 1.0 / dt if dt > 0 else 30.0
+        # Smooth, clean alpha-blend over camera feed (zero fake neon grids)
+        blended = cv2.addWeighted(color_mask, alpha, frame, 1.0 - alpha, 0)
+
+        t_total = time.perf_counter() - t_frame_start
+        curr_fps = 1.0 / t_total if t_total > 0 else 30.0
         fps_smooth = 0.9 * fps_smooth + 0.1 * curr_fps
 
         h, w = frame.shape[:2]
 
-        # Authentic UGV Telemetry Bar
-        cv2.rectangle(blended, (12, 12), (420, 78), (15, 15, 15), -1)
-        cv2.rectangle(blended, (12, 12), (420, 78), (50, 50, 50), 1)
+        # Top Telemetry Header
+        cv2.rectangle(blended, (12, 12), (390, 78), (15, 15, 15), -1)
+        cv2.rectangle(blended, (12, 12), (390, 78), (50, 50, 50), 1)
 
-        cv2.putText(blended, "UGV 3D PERSPECTIVE TRAVERSABILITY", (22, 32),
+        cv2.putText(blended, "UGV REAL-TIME TRAVERSABILITY", (22, 32),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
-
         cv2.putText(blended, f"DEVICE: {engine.device_name}", (22, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.40, (0, 255, 180), 1, cv2.LINE_AA)
+        cv2.putText(blended, f"GPU INFER: {gpu_latency:.1f}ms  |  FPS: {fps_smooth:.1f}", (22, 68),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.40, (220, 220, 220), 1, cv2.LINE_AA)
 
-        cv2.putText(blended, f"GPU INFER: {gpu_latency:.1f}ms | PIPELINE: {fps_smooth:.1f} FPS", (22, 68),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220, 220, 220), 1, cv2.LINE_AA)
-
-        # Nav2 Costmap (Top Right)
+        # Nav2 Metric Costmap (Picture-in-Picture)
         mini_w, mini_h = 160, 90
         mini_costmap = cv2.resize(costmap, (mini_w, mini_h), interpolation=cv2.INTER_NEAREST)
         mini_bgr = cv2.cvtColor(mini_costmap, cv2.COLOR_GRAY2BGR)
-
         x_offset = w - mini_w - 14
         y_offset = 14
         blended[y_offset:y_offset + mini_h, x_offset:x_offset + mini_w] = mini_bgr
@@ -339,7 +280,23 @@ def run_pipeline(source=0, alpha: float = 0.40):
         cv2.putText(blended, "Nav2 Costmap", (x_offset + 5, y_offset + 14),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 180), 1, cv2.LINE_AA)
 
-        cv2.imshow("Autonomous UGV Traversability [Perspective Ground Mesh]", blended)
+        # Legend (Bottom Left)
+        leg_y = h - 20
+        cv2.rectangle(blended, (12, leg_y - 20), (510, leg_y + 10), (15, 15, 15), -1)
+        # Green patch
+        cv2.rectangle(blended, (20, leg_y - 12), (32, leg_y), (34, 180, 34), -1)
+        cv2.putText(blended, "Floor", (38, leg_y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
+        # Cyan patch
+        cv2.rectangle(blended, (90, leg_y - 12), (102, leg_y), (255, 200, 0), -1)
+        cv2.putText(blended, "Stairway", (108, leg_y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
+        # Red patch
+        cv2.rectangle(blended, (195, leg_y - 12), (207, leg_y), (40, 40, 220), -1)
+        cv2.putText(blended, "Obstacle", (213, leg_y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
+        # Gray patch
+        cv2.rectangle(blended, (300, leg_y - 12), (312, leg_y), (70, 70, 70), -1)
+        cv2.putText(blended, "Ceiling", (318, leg_y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
+
+        cv2.imshow("Autonomous Traversability Perception [RTX 4050]", blended)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             print("Perception session stopped by user.")
@@ -350,11 +307,11 @@ def run_pipeline(source=0, alpha: float = 0.40):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Autonomous Traversability with Perspective Ground Grid")
+    parser = argparse.ArgumentParser(description="Autonomous Traversability Engine on RTX 4050")
     parser.add_argument("--url", type=str, default=None, help="Wireless Phone IP Webcam URL")
-    parser.add_argument("--webcam", type=int, default=0, help="Local Webcam device ID (default: 0)")
+    parser.add_argument("--webcam", type=int, default=0, help="Webcam device ID (default: 0)")
     parser.add_argument("--video", type=str, default=None, help="Path to video file")
-    parser.add_argument("--alpha", type=float, default=0.40, help="Mask overlay alpha (default: 0.40)")
+    parser.add_argument("--alpha", type=float, default=0.35, help="Mask overlay alpha (default: 0.35)")
     args = parser.parse_args()
 
     src = args.url if args.url else (args.video if args.video else args.webcam)
