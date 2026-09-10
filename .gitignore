@@ -5,4 +5,5 @@ __pycache__/
 .ipynb_checkpoints/
 *.mp4
 *.avi
-test_gpu_output.jpg
+*.pt
+test_*.jpg
