@@ -166,6 +166,17 @@ class AcousticDoAEngine:
         else:
             self.source_mode = "local"
             self.net_streamer = None
+            
+            # Prefer laptop hardware stereo mic array (Realtek) for genuine Left/Right separation
+            if device_index is None:
+                try:
+                    for idx, d in enumerate(sd.query_devices()):
+                        if "Realtek" in d.get("name", "") and d.get("max_input_channels", 0) >= 2:
+                            device_index = idx
+                            break
+                except Exception:
+                    pass
+
             self.source_info = "LAPTOP STEREO MIC ARRAY"
             try:
                 self.stream = sd.InputStream(
@@ -177,22 +188,30 @@ class AcousticDoAEngine:
                     dtype="float32",
                 )
                 self.stream.start()
-                print("[AUDIO] Local hardware stereo stream active.")
+                print(f"[AUDIO] Hardware stereo stream active on device: {self.source_info}")
             except Exception as e:
                 print(f"[ERROR] Failed to start local microphone: {e}")
                 self.running = False
                 return
 
-        # Precompute bandpass filter mask (300 Hz - 3400 Hz)
+        # Precompute bandpass filter masks
         n_fft = 2 * self.buffer_size
         freqs = np.fft.rfftfreq(n_fft, d=1.0 / self.fs)
-        self.freq_mask = (freqs >= 250.0) & (freqs <= 3800.0)
+        self.mode = "beacon"  # "beacon" (for noisy halls/beeps) or "voice" (for human speech)
+        self.beacon_mask = (freqs >= 1700.0) & (freqs <= 2700.0)
+        self.voice_mask = (freqs >= 250.0) & (freqs <= 3800.0)
 
         # Start worker thread
         self.worker_thread = threading.Thread(target=self._process_loop, daemon=True)
         self.worker_thread.start()
-        print(f"[AUDIO] Source: {self.source_info}")
+        print(f"[AUDIO] Source: {self.source_info} | Initial Mode: BEACON BEEP (2kHz)")
         print("=" * 60 + "\n")
+
+    def toggle_mode(self) -> str:
+        """Toggles between BEACON BEEP mode and VOICE mode."""
+        self.mode = "voice" if self.mode == "beacon" else "beacon"
+        print(f"[AUDIO] Active Mode Switched -> {self.mode.upper()}")
+        return self.mode
 
     def _audio_callback(self, indata, frames, time_info, status):
         if not self.running:
@@ -202,10 +221,13 @@ class AcousticDoAEngine:
             self.audio_buffer[:-chunk_len] = self.audio_buffer[chunk_len:]
             self.audio_buffer[-chunk_len:] = indata
 
-    def _gcc_phat(self, s1: np.ndarray, s2: np.ndarray, interp: int = 8) -> Tuple[float, float]:
+    def _gcc_phat(self, s1: np.ndarray, s2: np.ndarray, mask: Optional[np.ndarray] = None, interp: int = 8) -> Tuple[float, float]:
+        if mask is None:
+            mask = self.beacon_mask if self.mode == "beacon" else self.voice_mask
+
         n = s1.shape[0] + s2.shape[0]
-        S1 = np.fft.rfft(s1, n=n) * self.freq_mask
-        S2 = np.fft.rfft(s2, n=n) * self.freq_mask
+        S1 = np.fft.rfft(s1, n=n) * mask
+        S2 = np.fft.rfft(s2, n=n) * mask
 
         R = S1 * np.conj(S2)
         denom = np.abs(R) + 1e-15
@@ -225,6 +247,7 @@ class AcousticDoAEngine:
         return tau, confidence
 
     def _process_loop(self):
+        n_fft = 2 * self.buffer_size
         while self.running:
             if self.source_mode == "network":
                 buf, channels, fs = self.net_streamer.get_buffer()
@@ -241,27 +264,52 @@ class AcousticDoAEngine:
             rms = np.sqrt(np.mean(s1**2 + s2**2) / 2.0) + 1e-12
             db = 20.0 * math.log10(rms)
 
-            if db > -42.0:
-                is_active = True
-                if is_stereo:
-                    tau, conf = self._gcc_phat(s1, s2)
-                    sin_arg = np.clip((self.c * tau) / self.d, -1.0, 1.0)
-                    angle_deg = -math.degrees(math.asin(sin_arg))
+            if self.mode == "beacon":
+                # BEACON BEEP MODE: Rejects library speech chatter, triggers on pure 2kHz beep tones
+                S1 = np.abs(np.fft.rfft(s1, n=n_fft))
+                in_band_energy = float(np.sum(S1[self.beacon_mask]**2))
+                total_energy = float(np.sum(S1**2) + 1e-12)
+                tonality = in_band_energy / total_energy
+                in_band_rms = np.sqrt(in_band_energy / max(1, np.sum(self.beacon_mask)))
+                in_band_db = 20.0 * math.log10(in_band_rms + 1e-12)
 
-                    alpha = 0.35 if conf > 0.4 else 0.10
-                    self.smoothed_angle = (1.0 - alpha) * self.smoothed_angle + alpha * angle_deg
-                    status = "VOICE / CRY DETECTED" if conf > 0.45 else "ACOUSTIC ACTIVITY"
+                # Pure beep concentrates >10% of total energy in narrow 2kHz bin
+                if tonality > 0.08 and in_band_db > -64.0:
+                    is_active = True
+                    if is_stereo:
+                        tau, conf = self._gcc_phat(s1, s2, mask=self.beacon_mask)
+                        sin_arg = np.clip((self.c * tau) / self.d, -1.0, 1.0)
+                        angle_deg = -math.degrees(math.asin(sin_arg))
+                        alpha = 0.45 if conf > 0.4 else 0.20
+                        self.smoothed_angle = (1.0 - alpha) * self.smoothed_angle + alpha * angle_deg
+                        status = f"BEACON LOCKED [2kHz] ({int(tonality*100)}% Tonality)"
+                    else:
+                        conf = min(1.0, tonality * 2.5)
+                        status = "MONO BEACON SPIKE"
                 else:
-                    conf = min(1.0, (db + 42.0) / 30.0)
-                    status = "PHONE MONO: SOUND SPIKE"
+                    is_active = False
+                    conf = 0.0
+                    status = "SCANNING FOR BEACON (2kHz)..."
             else:
-                is_active = False
-                conf = 0.0
-                status = "MONITORING RUBBLE..."
+                # VOICE MODE: Broadband speech detection
+                if db > -52.0:
+                    is_active = True
+                    if is_stereo:
+                        tau, conf = self._gcc_phat(s1, s2, mask=self.voice_mask)
+                        sin_arg = np.clip((self.c * tau) / self.d, -1.0, 1.0)
+                        angle_deg = -math.degrees(math.asin(sin_arg))
+                        alpha = 0.35 if conf > 0.4 else 0.10
+                        self.smoothed_angle = (1.0 - alpha) * self.smoothed_angle + alpha * angle_deg
+                        status = "VOICE / CRY DETECTED" if conf > 0.45 else "ACOUSTIC ACTIVITY"
+                    else:
+                        conf = min(1.0, (db + 52.0) / 30.0)
+                        status = "PHONE MONO: SOUND SPIKE"
+                else:
+                    is_active = False
+                    conf = 0.0
+                    status = "MONITORING RUBBLE..."
 
-            src_tag = "PHONE (STEREO)" if (self.source_mode == "network" and is_stereo) else (
-                "PHONE (MONO)" if self.source_mode == "network" else "LAPTOP ARRAY"
-            )
+            src_tag = f"{self.source_info} [{self.mode.upper()}]"
 
             with self.lock:
                 self.current_target = AcousticTarget(
@@ -345,12 +393,14 @@ def render_acoustic_compass(target: AcousticTarget, size: int = 420) -> np.ndarr
     # Telemetry Banner
     cv2.rectangle(img, (10, 10), (size - 10, 55), (15, 15, 15), -1)
     cv2.rectangle(img, (10, 10), (size - 10, 55), (50, 50, 50), 1)
-    cv2.putText(img, "ACOUSTIC VOICE LOCALIZATION", (20, 26),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
+    title = "ACOUSTIC RADAR [BEACON 2kHz]" if "BEACON" in target.source_info else "ACOUSTIC RADAR [VOICE CHATTER]"
+    title_col = (0, 255, 255) if "BEACON" in target.source_info else (255, 255, 255)
+    cv2.putText(img, title, (18, 26),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, title_col, 1, cv2.LINE_AA)
 
     stat_col = (0, 255, 180) if target.is_active else (120, 120, 120)
-    cv2.putText(img, f"STATUS: {target.status_text} [{target.source_info}]", (20, 44),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.32, stat_col, 1, cv2.LINE_AA)
+    cv2.putText(img, f"{target.status_text}", (18, 44),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.30, stat_col, 1, cv2.LINE_AA)
 
     # Bearing & SNR
     sign = "+" if target.azimuth_deg >= 0 else ""

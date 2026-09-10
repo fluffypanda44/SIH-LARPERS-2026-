@@ -1,16 +1,16 @@
 """
 Urban Search & Rescue (USAR) Unified Autonomous Mission Control Engine.
-Hardware-Accelerated on GPU via ONNX DirectML / CUDA.
+Hardware-Accelerated on NVIDIA GeForce RTX 4050 Laptop GPU via ONNX DirectML.
 
-Multi-modal perception pipeline:
+Multi-modal disaster perception & actuation:
 1. Rubble & Stairway Traversability (SegFormer-B0 DirectML: Green=Floor, Cyan=Stairway, Red=Obstacle)
 2. Trapped Survivor Pose & Posture Detection (YOLOv8-Pose DirectML: High-Recall conf=0.18)
-3. Acoustic Voice Direction of Arrival Radar (GCC-PHAT Microphone Array in bottom-right corner)
-4. Autonomous Navigation Waypoint & Actuation Dispatcher (ROS2 geometry_msgs/Twist over UDP :9090)
+3. Acoustic Direction of Arrival Radar (GCC-PHAT Dual-Mode: Emergency Beacon Beep 2kHz vs Voice)
+4. Closed-Loop Actuation Dispatcher (ROS2 geometry_msgs/Twist over UDP :9090)
 
 Supports:
-- Local Webcams / Integrated HD Cameras
 - Wireless Phone IP Webcam Streams (--url http://<IP>:8080)
+- Local Webcams / Integrated HD Cameras (--webcam 0)
 - Recorded Disaster Video Files (--video <path>)
 """
 
@@ -121,8 +121,8 @@ def run_mission_control(
 ):
     print("\n" + "=" * 70)
     print(" LAUNCHING USAR UNIFIED AUTONOMOUS MISSION CONTROL")
-    print(" Architecture: Tactical Base-Station Node + Split Edge Actuation")
-    print(" Clean Perception: Semantic Segmentation + Survivor Tracking + Acoustic Radar")
+    print(" Architecture: Tactical Base-Station Node + Dual DirectML AI")
+    print(" Perception: Semantic Segmentation + Survivor Tracking + Acoustic Radar")
     print(f" Telemetry Bridge: ROS2 Twist UDP Broadcast on port {udp_port}")
     print("=" * 70)
 
@@ -132,20 +132,20 @@ def run_mission_control(
     navigator = AutonomousNavigator()
     actuation_bridge = ActuationBridge(udp_port=udp_port)
 
-    # 2. Initialize Audio DoA Engine
-    audio_engine = AcousticDoAEngine(url=audio_url, mic_distance_m=0.16)
+    # 2. Initialize Audio DoA Engine (defaults to laptop's stereo array for true Left/Right DoA)
+    audio_engine = AcousticDoAEngine(url=audio_url, mic_distance_m=0.18)
 
     # 3. Initialize Video Ingestion
     is_network_stream = isinstance(video_source, str) and (
         video_source.startswith("http://")
         or video_source.startswith("https://")
         or video_source.startswith("rtsp://")
-        or ":" in video_source
+        or ":" in str(video_source)
     )
 
     if is_network_stream:
         stream_url = format_stream_url(str(video_source))
-        print(f"[MISSION CONTROL] Connecting to video stream: {stream_url}")
+        print(f"[MISSION CONTROL] Connecting to wireless stream: {stream_url}")
         cap = ThreadedCamera(stream_url)
         time.sleep(1.0)
     else:
@@ -170,6 +170,7 @@ def run_mission_control(
     print(" USAR MISSION CONTROL ACTIVE")
     print(" Controls:")
     print("   - Press 'q' to exit")
+    print("   - Press 'b' to toggle Acoustic Mode (BEACON BEEP 2kHz vs VOICE)")
     print("   - Press 't' to toggle Traversability Mask")
     print("   - Press 's' to toggle Survivor Detection")
     print("   - Press 'r' to toggle Acoustic Radar")
@@ -205,7 +206,7 @@ def run_mission_control(
             t_pose = 0.0
 
         # -------------------------------------------------------------
-        # STEP 3: Acoustic Voice Direction Acquisition (Radar only)
+        # STEP 3: Acoustic Voice / Beacon Direction Acquisition
         # -------------------------------------------------------------
         acoustic_target = audio_engine.get_target()
 
@@ -224,7 +225,7 @@ def run_mission_control(
         # -------------------------------------------------------------
         # HUD 1: Top Left Mission Telemetry Header
         # -------------------------------------------------------------
-        header_w, header_h = 460, 88
+        header_w, header_h = 470, 88
         cv2.rectangle(blended, (12, 12), (12 + header_w, 12 + header_h), (15, 15, 15), -1)
         cv2.rectangle(blended, (12, 12), (12 + header_w, 12 + header_h), (50, 50, 50), 1)
 
@@ -234,7 +235,7 @@ def run_mission_control(
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 180), 1, cv2.LINE_AA)
         cv2.putText(blended, f"PIPELINE: {fps_smooth:.1f} FPS | DUAL INFER: {total_gpu_time:.1f} ms", (22, 68),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220, 220, 220), 1, cv2.LINE_AA)
-        cv2.putText(blended, f"SURVIVORS: {len(survivors)} | AUDIO: {acoustic_target.status_text} [{acoustic_target.source_info}]", (22, 85),
+        cv2.putText(blended, f"SURVIVORS: {len(survivors)} | AUDIO: {acoustic_target.status_text}", (22, 85),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.32, (0, 200, 255), 1, cv2.LINE_AA)
 
         # -------------------------------------------------------------
@@ -302,6 +303,9 @@ def run_mission_control(
         if key == ord("q"):
             print("Mission control stopped by operator.")
             break
+        elif key == ord("b"):
+            new_mode = audio_engine.toggle_mode()
+            print(f"[MISSION CONTROL] Toggled Audio Mode to: {new_mode.upper()}")
         elif key == ord("t"):
             show_traversability = not show_traversability
         elif key == ord("s"):
@@ -326,7 +330,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     v_src = args.url if args.url else (args.video if args.video else args.webcam)
-    # Default to laptop's built-in hardware stereo mic array for true Left/Right sound localization
     a_src = args.audio_url
 
     run_mission_control(video_source=v_src, audio_url=a_src, alpha=args.alpha, udp_port=args.udp_port)
