@@ -1,0 +1,10 @@
+# ============================================================
+# USAR Autonomous Perception Engine — Runtime Dependencies
+# Hardware: NVIDIA GPU with DirectML support (RTX 4050+)
+# Python:  3.11+
+# ============================================================
+
+numpy>=2.0
+opencv-python>=5.0
+onnxruntime-directml>=1.24
+sounddevice>=0.5
