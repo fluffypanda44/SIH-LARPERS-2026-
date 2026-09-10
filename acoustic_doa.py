@@ -130,14 +130,14 @@ class AcousticDoAEngine:
         url: Optional[str] = None,
         samplerate: int = 44100,
         buffer_size: int = 4096,
-        mic_distance_m: float = 0.16,
+        mic_distance_m: float = 0.060,  # ASUS TUF Gaming F16 (FX607VU) dual-mic array baseline is 6.0 cm
         device_index: Optional[int] = None,
         speed_of_sound: float = 343.0,
     ):
         self.url = url
         self.fs = samplerate
         self.buffer_size = buffer_size
-        self.d = mic_distance_m  # Nothing Phone (2a) baseline is ~0.16m
+        self.d = mic_distance_m  # 0.06m on ASUS TUF F16
         self.c = speed_of_sound
         self.max_tau = self.d / self.c
 
@@ -221,7 +221,7 @@ class AcousticDoAEngine:
             self.audio_buffer[:-chunk_len] = self.audio_buffer[chunk_len:]
             self.audio_buffer[-chunk_len:] = indata
 
-    def _gcc_phat(self, s1: np.ndarray, s2: np.ndarray, mask: Optional[np.ndarray] = None, interp: int = 8) -> Tuple[float, float]:
+    def _gcc_phat(self, s1: np.ndarray, s2: np.ndarray, mask: Optional[np.ndarray] = None, interp: int = 32) -> Tuple[float, float]:
         if mask is None:
             mask = self.beacon_mask if self.mode == "beacon" else self.voice_mask
 
@@ -273,13 +273,13 @@ class AcousticDoAEngine:
                 in_band_rms = np.sqrt(in_band_energy / max(1, np.sum(self.beacon_mask)))
                 in_band_db = 20.0 * math.log10(in_band_rms + 1e-12)
 
-                # Pure beep concentrates >10% of total energy in narrow 2kHz bin
+                # Pure beep concentrates >8% of total energy in narrow 2kHz bin
                 if tonality > 0.08 and in_band_db > -64.0:
                     is_active = True
                     if is_stereo:
                         tau, conf = self._gcc_phat(s1, s2, mask=self.beacon_mask)
                         sin_arg = np.clip((self.c * tau) / self.d, -1.0, 1.0)
-                        angle_deg = -math.degrees(math.asin(sin_arg))
+                        angle_deg = math.degrees(math.asin(sin_arg))
                         alpha = 0.45 if conf > 0.4 else 0.20
                         self.smoothed_angle = (1.0 - alpha) * self.smoothed_angle + alpha * angle_deg
                         status = f"BEACON LOCKED [2kHz] ({int(tonality*100)}% Tonality)"
@@ -297,7 +297,7 @@ class AcousticDoAEngine:
                     if is_stereo:
                         tau, conf = self._gcc_phat(s1, s2, mask=self.voice_mask)
                         sin_arg = np.clip((self.c * tau) / self.d, -1.0, 1.0)
-                        angle_deg = -math.degrees(math.asin(sin_arg))
+                        angle_deg = math.degrees(math.asin(sin_arg))
                         alpha = 0.35 if conf > 0.4 else 0.10
                         self.smoothed_angle = (1.0 - alpha) * self.smoothed_angle + alpha * angle_deg
                         status = "VOICE / CRY DETECTED" if conf > 0.45 else "ACOUSTIC ACTIVITY"

@@ -132,8 +132,8 @@ def run_mission_control(
     navigator = AutonomousNavigator()
     actuation_bridge = ActuationBridge(udp_port=udp_port)
 
-    # 2. Initialize Audio DoA Engine (defaults to laptop's stereo array for true Left/Right DoA)
-    audio_engine = AcousticDoAEngine(url=audio_url, mic_distance_m=0.18)
+    # 2. Initialize Audio DoA Engine (calibrated to 6.0 cm for ASUS TUF Gaming F16 top-bezel array)
+    audio_engine = AcousticDoAEngine(url=audio_url, mic_distance_m=0.060)
 
     # 3. Initialize Video Ingestion
     is_network_stream = isinstance(video_source, str) and (
