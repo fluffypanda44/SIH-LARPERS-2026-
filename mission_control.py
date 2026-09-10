@@ -1,12 +1,14 @@
 """
 Urban Search & Rescue (USAR) Unified Autonomous Mission Control Engine.
-Hardware-Accelerated on NVIDIA GeForce RTX 4050 Laptop GPU via ONNX DirectML.
+Hardware-Accelerated on GPU via ONNX DirectML / CUDA.
 
-Multi-modal disaster perception & actuation:
+Multi-modal disaster perception, evidential fusion & DWA trajectory planning:
 1. Rubble & Stairway Traversability (SegFormer-B0 DirectML: Green=Floor, Cyan=Stairway, Red=Obstacle)
 2. Trapped Survivor Pose & Posture Detection (YOLOv8-Pose DirectML: High-Recall conf=0.18)
 3. Acoustic Direction of Arrival Radar (GCC-PHAT Dual-Mode: Emergency Beacon Beep 2kHz vs Voice)
-4. Closed-Loop Actuation Dispatcher (ROS2 geometry_msgs/Twist over UDP :9090)
+4. Evidential Multi-Modal Fusion (Dempster-Shafer belief reasoning & triage severity)
+5. Dynamic Window Approach (DWA) Local Trajectory Planner (21-arc kinematic splines)
+6. Closed-Loop Actuation Dispatcher (ROS2 geometry_msgs/Twist over UDP :9090)
 
 Supports:
 - Wireless Phone IP Webcam Streams (--url http://<IP>:8080)
@@ -19,7 +21,6 @@ import math
 import sys
 import threading
 import time
-from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
 
 import cv2
@@ -29,88 +30,10 @@ import numpy as np
 from acoustic_doa import AcousticDoAEngine, AcousticTarget, render_acoustic_compass
 from actuation_bridge import ActuationBridge
 from camera_utils import ThreadedCamera, format_stream_url
+from evidential_fusion import EvidentialFusionEngine, FusedMissionBelief
 from real_vision import UGVVisionEngine
 from survivor_detector import SurvivorDetector, SurvivorTarget
-
-
-@dataclass
-class AutonomousNavCommand:
-    mode: str                    # "VISUAL_SURVIVOR_LOCK", "ACOUSTIC_HOMING", "PATROL_STABLE_SLAB"
-    target_heading_deg: float    # Desired steering angle (-90° to +90°)
-    target_distance_m: float     # Estimated distance
-    recommended_speed: float     # Linear speed m/s
-    action_text: str             # Human readable mission dispatch command
-
-
-class AutonomousNavigator:
-    """Computes real-time navigation dispatch commands based on multi-modal sensory input."""
-
-    def __init__(self):
-        self.last_audio_heading = 0.0
-
-    def compute_nav_command(
-        self,
-        survivors: List[SurvivorTarget],
-        acoustic_target: AcousticTarget,
-        costmap: np.ndarray,
-    ) -> AutonomousNavCommand:
-        # Priority 1: Visual Survivor Lock (Line-of-Sight)
-        if len(survivors) > 0:
-            target = survivors[0]
-            heading = target.bearing_deg
-            dist = target.est_distance_m
-
-            if dist <= 1.2:
-                mode = "RESCUE_STATIONARY"
-                speed = 0.0
-                action = f"HALT: SURVIVOR AT {dist:.1f}m | LOCK BRAKES & SIGNAL CREW"
-            else:
-                mode = "VISUAL_SURVIVOR_LOCK"
-                speed = 0.55 if target.entrapment == "EXPOSED" else 0.35
-                turn_dir = "RIGHT" if heading > 0 else "LEFT"
-                action = f"APPROACH SURVIVOR #{target.target_id} [{target.posture}]: STEER {abs(heading):.1f}° {turn_dir} | DIST {dist:.1f}m"
-
-            return AutonomousNavCommand(
-                mode=mode,
-                target_heading_deg=heading,
-                target_distance_m=dist,
-                recommended_speed=speed,
-                action_text=action,
-            )
-
-        # Priority 2: Acoustic Homing (Trapped sound behind debris / Non-Line-of-Sight)
-        if acoustic_target.is_active and acoustic_target.confidence > 0.30:
-            self.last_audio_heading = acoustic_target.azimuth_deg
-            turn_dir = "RIGHT" if self.last_audio_heading > 0 else "LEFT"
-            return AutonomousNavCommand(
-                mode="ACOUSTIC_HOMING",
-                target_heading_deg=self.last_audio_heading,
-                target_distance_m=5.0,
-                recommended_speed=0.35,
-                action_text=f"ACOUSTIC HOMING: ROTATE {abs(self.last_audio_heading):.1f}° {turn_dir} TOWARDS DISTRESS SOUND",
-            )
-
-        # Priority 3: Autonomous Patrol on Safe Rubble / Slabs
-        h, w = costmap.shape[:2]
-        forward_sector = costmap[int(h * 0.70):, int(w * 0.35):int(w * 0.65)]
-        mean_cost = float(np.mean(forward_sector)) if forward_sector.size > 0 else 0.0
-
-        if mean_cost > 150:
-            action = "OBSTACLE IN FRONT: SCANNING ALTERNATE CORRIDOR"
-            speed = 0.0
-            heading = 25.0
-        else:
-            action = "SECTOR PATROL: FORWARD PATH CLEAR ON STABLE GROUND"
-            speed = 0.60
-            heading = 0.0
-
-        return AutonomousNavCommand(
-            mode="PATROL_STABLE_SLAB",
-            target_heading_deg=heading,
-            target_distance_m=10.0,
-            recommended_speed=speed,
-            action_text=action,
-        )
+from trajectory_planner import DWAPlanner
 
 
 def run_mission_control(
@@ -121,21 +44,24 @@ def run_mission_control(
 ):
     print("\n" + "=" * 70)
     print(" LAUNCHING USAR UNIFIED AUTONOMOUS MISSION CONTROL")
-    print(" Architecture: Tactical Base-Station Node + Dual DirectML AI")
-    print(" Perception: Semantic Segmentation + Survivor Tracking + Acoustic Radar")
+    print(" Architecture: Evidential Multi-Modal Fusion + DWA Trajectory Planner")
+    print(" Hardware Acceleration: DirectML Dual AI Pipeline")
     print(f" Telemetry Bridge: ROS2 Twist UDP Broadcast on port {udp_port}")
     print("=" * 70)
 
     # 1. Initialize Dual AI Engines
     vision_engine = UGVVisionEngine("segformer_b0.onnx")
     survivor_detector = SurvivorDetector("yolov8n-pose.onnx", conf_thresh=0.18, iou_thresh=0.60)
-    navigator = AutonomousNavigator()
+    
+    # 2. Initialize Evidential Fusion & DWA Local Trajectory Planner
+    fusion_engine = EvidentialFusionEngine()
+    dwa_planner = DWAPlanner(max_speed=0.65, max_yaw_rate=1.2, sim_time_s=1.4)
     actuation_bridge = ActuationBridge(udp_port=udp_port)
 
-    # 2. Initialize Audio DoA Engine (calibrated to 6.0 cm for ASUS TUF Gaming F16 top-bezel array)
+    # 3. Initialize Audio DoA Engine (defaults to laptop's stereo array for true Left/Right DoA)
     audio_engine = AcousticDoAEngine(url=audio_url, mic_distance_m=0.060)
 
-    # 3. Initialize Video Ingestion
+    # 4. Initialize Video Ingestion
     is_network_stream = isinstance(video_source, str) and (
         video_source.startswith("http://")
         or video_source.startswith("https://")
@@ -165,12 +91,14 @@ def run_mission_control(
     show_traversability = True
     show_survivors = True
     show_radar = True
+    show_trajectories = True
 
     print("\n" + "=" * 70)
     print(" USAR MISSION CONTROL ACTIVE")
     print(" Controls:")
     print("   - Press 'q' to exit")
     print("   - Press 'b' to toggle Acoustic Mode (BEACON BEEP 2kHz vs VOICE)")
+    print("   - Press 'p' to toggle DWA Trajectory Splines")
     print("   - Press 't' to toggle Traversability Mask")
     print("   - Press 's' to toggle Survivor Detection")
     print("   - Press 'r' to toggle Acoustic Radar")
@@ -211,10 +139,28 @@ def run_mission_control(
         acoustic_target = audio_engine.get_target()
 
         # -------------------------------------------------------------
-        # STEP 4: Autonomous Navigation Decision & Actuation Dispatch
+        # STEP 4: Evidential Multi-Modal Fusion (Dempster-Shafer)
         # -------------------------------------------------------------
-        nav_cmd = navigator.compute_nav_command(survivors, acoustic_target, costmap)
-        telemetry = actuation_bridge.dispatch(nav_cmd)
+        belief = fusion_engine.fuse(survivors, acoustic_target, costmap)
+
+        # -------------------------------------------------------------
+        # STEP 5: Dynamic Window Trajectory Rollout Planning (DWA)
+        # -------------------------------------------------------------
+        best_v, best_w, candidates, best_cand = dwa_planner.plan(
+            costmap,
+            goal_heading_deg=belief.target_heading_deg,
+            target_dist_m=belief.target_distance_m,
+            is_emergency_halt=belief.is_emergency_halt,
+        )
+
+        # Render Waymo/Tesla-style trajectory candidate splines on camera feed
+        if show_trajectories:
+            dwa_planner.render_trajectories(blended, candidates, best_cand)
+
+        # Override kinematic velocities with DWA optimal trajectory
+        belief.recommended_speed = best_v
+        # Dispatch closed-loop command over UDP 9090
+        telemetry = actuation_bridge.dispatch(belief)
 
         # Timing & Framerate
         total_gpu_time = t_seg + t_pose
@@ -225,18 +171,20 @@ def run_mission_control(
         # -------------------------------------------------------------
         # HUD 1: Top Left Mission Telemetry Header
         # -------------------------------------------------------------
-        header_w, header_h = 470, 88
+        header_w, header_h = 490, 92
         cv2.rectangle(blended, (12, 12), (12 + header_w, 12 + header_h), (15, 15, 15), -1)
         cv2.rectangle(blended, (12, 12), (12 + header_w, 12 + header_h), (50, 50, 50), 1)
 
         cv2.putText(blended, "USAR AUTONOMOUS RESCUE MISSION CONTROL", (22, 32),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(blended, f"DEVICE: {vision_engine.device_name} (Dual AI Pipeline)", (22, 50),
+        cv2.putText(blended, f"DEVICE: {vision_engine.device_name} (Dual AI DirectML)", (22, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 180), 1, cv2.LINE_AA)
         cv2.putText(blended, f"PIPELINE: {fps_smooth:.1f} FPS | DUAL INFER: {total_gpu_time:.1f} ms", (22, 68),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220, 220, 220), 1, cv2.LINE_AA)
-        cv2.putText(blended, f"SURVIVORS: {len(survivors)} | AUDIO: {acoustic_target.status_text}", (22, 85),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.32, (0, 200, 255), 1, cv2.LINE_AA)
+        
+        fused_str = f"FUSED BELIEF P(VICTIM): {belief.belief_victim_present:.2f} | SEVERITY: {belief.entrapment_severity_index:.0f}/100"
+        cv2.putText(blended, fused_str, (22, 86),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 255, 255), 1, cv2.LINE_AA)
 
         # -------------------------------------------------------------
         # HUD 2: Picture-in-Picture 1: Nav2 Metric Costmap (Top Right)
@@ -271,29 +219,27 @@ def run_mission_control(
         nav_bar_y = h - nav_bar_h - 10
         cv2.rectangle(blended, (12, nav_bar_y), (w - 12, nav_bar_y + nav_bar_h), (12, 12, 12), -1)
 
-        if nav_cmd.mode == "VISUAL_SURVIVOR_LOCK":
+        if "LINE_OF_SIGHT" in belief.hypothesis:
             border_col = (0, 255, 255)   # Yellow
             mode_tag = "[SURVIVOR INTERCEPT]"
-        elif nav_cmd.mode == "RESCUE_STATIONARY":
+        elif "BURIED" in belief.hypothesis:
+            border_col = (0, 255, 120)   # Green
+            mode_tag = "[SUB-SURFACE ACOUSTIC HOMING]"
+        elif belief.is_emergency_halt:
             border_col = (0, 0, 255)     # Red
             mode_tag = "[TARGET REACHED - BRAKE]"
-        elif nav_cmd.mode == "ACOUSTIC_HOMING":
-            border_col = (0, 255, 120)   # Bright green
-            mode_tag = "[ACOUSTIC HOMING]"
         else:
             border_col = (100, 100, 100) # Neutral
-            mode_tag = "[AUTONOMOUS PATROL]"
+            mode_tag = "[AUTONOMOUS RECON PATROL]"
 
         cv2.rectangle(blended, (12, nav_bar_y), (w - 12, nav_bar_y + nav_bar_h), border_col, 2)
         
-        # Line 1: High-level action text
-        cv2.putText(blended, f"NAV2 AUTOPILOT {mode_tag}: {nav_cmd.action_text}",
+        # Line 1: High-level action statement
+        cv2.putText(blended, f"NAV2 AUTOPILOT {mode_tag}: {belief.action_text}",
                     (24, nav_bar_y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 255, 255), 1, cv2.LINE_AA)
 
-        # Line 2: Real-time Twist Actuation Output (Closed Loop)
-        vx = telemetry.twist["linear"]["x"]
-        wz = telemetry.twist["angular"]["z"]
-        tx_text = f"ROBOT ACTUATION [ROS2 cmd_vel Twist] -> vx: {vx:+.2f} m/s | wz: {wz:+.2f} rad/s | TX: UDP:127.0.0.1:{udp_port}"
+        # Line 2: DWA Real-time Twist Actuation Output (Closed Loop)
+        tx_text = f"DWA TRAJECTORY PLANNER [ROS2 cmd_vel] -> vx: {best_v:+.2f} m/s | wz: {best_w:+.2f} rad/s | 21-Arc Rollouts [UDP:9090]"
         cv2.putText(blended, tx_text, (24, nav_bar_y + 46),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.36, (0, 255, 180), 1, cv2.LINE_AA)
 
@@ -306,6 +252,8 @@ def run_mission_control(
         elif key == ord("b"):
             new_mode = audio_engine.toggle_mode()
             print(f"[MISSION CONTROL] Toggled Audio Mode to: {new_mode.upper()}")
+        elif key == ord("p"):
+            show_trajectories = not show_trajectories
         elif key == ord("t"):
             show_traversability = not show_traversability
         elif key == ord("s"):

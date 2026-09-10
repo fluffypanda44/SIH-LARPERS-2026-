@@ -175,6 +175,8 @@ python mission_control.py --webcam 0 --audio-url http://192.168.1.5:8080
 
 | Key | Action |
 |---|---|
+| `p` | Toggle DWA trajectory rollout splines (Tesla/Waymo style) |
+| `b` | Toggle acoustic mode (Emergency Beacon Beep 2kHz vs Voice) |
 | `t` | Toggle traversability mask overlay |
 | `s` | Toggle survivor detection skeletons |
 | `r` | Toggle acoustic radar compass |
@@ -186,10 +188,12 @@ python mission_control.py --webcam 0 --audio-url http://192.168.1.5:8080
 
 ```
 SIH-LARPERS-2026-/
-├── mission_control.py      # Unified HUD — fuses all 3 engines + autonomous navigator
+├── mission_control.py      # Unified HUD — fuses dual AI engines + DWA trajectory planner
+├── evidential_fusion.py    # Dempster-Shafer evidential sensor fusion (replaces if/else logic)
+├── trajectory_planner.py   # DWA local costmap planner (21-arc kinematic splines)
 ├── real_vision.py          # SegFormer-B0 traversability perception engine
 ├── survivor_detector.py    # YOLOv8n-Pose survivor detection & pose estimation
-├── acoustic_doa.py         # GCC-PHAT acoustic direction-of-arrival engine
+├── acoustic_doa.py         # GCC-PHAT dual-mode acoustic direction-of-arrival engine
 ├── actuation_bridge.py     # Closed-loop robotics dispatcher (ROS2 Twist over UDP :9090)
 ├── camera_utils.py         # Resilient threaded video capture & reconnect handler
 ├── segformer_b0.onnx       # SegFormer-B0 weights (ADE20K 150-class) [Git LFS]
