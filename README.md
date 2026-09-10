@@ -190,6 +190,8 @@ SIH-LARPERS-2026-/
 ├── real_vision.py          # SegFormer-B0 traversability perception engine
 ├── survivor_detector.py    # YOLOv8n-Pose survivor detection & pose estimation
 ├── acoustic_doa.py         # GCC-PHAT acoustic direction-of-arrival engine
+├── actuation_bridge.py     # Closed-loop robotics dispatcher (ROS2 Twist over UDP :9090)
+├── camera_utils.py         # Resilient threaded video capture & reconnect handler
 ├── segformer_b0.onnx       # SegFormer-B0 weights (ADE20K 150-class) [Git LFS]
 ├── yolov8n-pose.onnx       # YOLOv8n-Pose weights (COCO 17-keypoint) [Git LFS]
 ├── requirements.txt        # Runtime dependencies

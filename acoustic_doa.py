@@ -64,57 +64,52 @@ class NetworkAudioStreamer:
         return url
 
     def _stream_worker(self):
-        try:
-            req = urllib.request.Request(self.url, headers={"User-Agent": "USAR-Perception-Bot/1.0"})
-            response = urllib.request.urlopen(req, timeout=5)
+        while self.running:
+            try:
+                req = urllib.request.Request(self.url, headers={"User-Agent": "USAR-Perception-Bot/1.0"})
+                response = urllib.request.urlopen(req, timeout=5)
 
-            # Read 44-byte standard RIFF WAV header
-            header = response.read(44)
-            if len(header) >= 44 and header[:4] == b"RIFF":
-                self.channels = int.from_bytes(header[22:24], "little")
-                self.fs = int.from_bytes(header[24:28], "little")
-                print(f"[NETWORK AUDIO] Connected! Channels: {self.channels} | Samplerate: {self.fs} Hz")
-            else:
-                self.channels = 1
-                self.fs = 44100
-                print("[NETWORK AUDIO] Warning: Unrecognized header, defaulting to Mono 44100 Hz")
-
-            self.connected = True
-            bytes_per_sample = 2  # 16-bit PCM
-            chunk_samples = 1024
-            chunk_bytes = chunk_samples * self.channels * bytes_per_sample
-
-            while self.running:
-                raw = response.read(chunk_bytes)
-                if not raw or len(raw) < chunk_bytes:
-                    time.sleep(0.01)
-                    continue
-
-                # Parse signed 16-bit integers to float32 (-1.0 to +1.0)
-                samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-
-                if self.channels >= 2:
-                    stereo = samples.reshape(-1, self.channels)[:, :2]
+                # Read 44-byte standard RIFF WAV header
+                header = response.read(44)
+                if len(header) >= 44 and header[:4] == b"RIFF":
+                    self.channels = int.from_bytes(header[22:24], "little")
+                    self.fs = int.from_bytes(header[24:28], "little")
+                    print(f"[NETWORK AUDIO] Connected! Channels: {self.channels} | Samplerate: {self.fs} Hz")
                 else:
-                    # Mono stream: replicate to 2 channels for energy measurement
-                    stereo = np.column_stack((samples, samples))
+                    self.channels = 1
+                    self.fs = 44100
+                    print("[NETWORK AUDIO] Warning: Unrecognized header, defaulting to Mono 44100 Hz")
 
-                with self.lock:
-                    n_new = len(stereo)
-                    self.audio_buffer[:-n_new] = self.audio_buffer[n_new:]
-                    self.audio_buffer[-n_new:] = stereo
+                self.connected = True
+                bytes_per_sample = 2  # 16-bit PCM
+                chunk_samples = 1024
+                chunk_bytes = chunk_samples * self.channels * bytes_per_sample
 
-        except urllib.error.URLError as e:
-            print(f"\n[ERROR] Could not connect to phone audio at: {self.url}")
-            print(f"Details: {e}")
-            print("Troubleshooting tips:")
-            print(" 1. Ensure phone and laptop are on the same local network / hotspot.")
-            print(" 2. In IP Webcam, make sure 'Audio' is enabled in app settings.")
-            print(" 3. If on university/library Wi-Fi, use phone hotspot or USB tethering.\n")
-            self.running = False
-        except Exception as e:
-            print(f"[NETWORK AUDIO ERROR] Stream failed: {e}")
-            self.running = False
+                while self.running:
+                    raw = response.read(chunk_bytes)
+                    if not raw or len(raw) < chunk_bytes:
+                        time.sleep(0.01)
+                        continue
+
+                    # Parse signed 16-bit integers to float32 (-1.0 to +1.0)
+                    samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+                    if self.channels >= 2:
+                        stereo = samples.reshape(-1, self.channels)[:, :2]
+                    else:
+                        stereo = np.column_stack((samples, samples))
+
+                    with self.lock:
+                        n_new = len(stereo)
+                        self.audio_buffer[:-n_new] = self.audio_buffer[n_new:]
+                        self.audio_buffer[-n_new:] = stereo
+
+            except urllib.error.URLError as e:
+                self.connected = False
+                time.sleep(2.0)
+            except Exception as e:
+                self.connected = False
+                time.sleep(2.0)
 
     def get_buffer(self) -> Tuple[np.ndarray, int, int]:
         with self.lock:

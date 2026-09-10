@@ -1,18 +1,17 @@
 """
 Urban Search & Rescue (USAR) Survivor Identification Engine.
-Hardware-Accelerated on NVIDIA GeForce RTX 4050 Laptop GPU via ONNX DirectML.
+Hardware-Accelerated on GPU via ONNX DirectML / CUDA.
 
-Calibrated for wide-angle camera optics & high-recall disaster rescue:
+Key Features:
 - High-Recall Detection (conf_thresh=0.18, iou_thresh=0.60) catches partially occluded & adjacent victims.
-- Calibrated Wide-Angle Distance Estimator (FOV ~82°): Accurately computes true metric distance (2m - 6m).
-- 17 Anatomical Keypoints: Classifies posture & entrapment severity.
+- Anthropometric Distance Estimator: Estimates target distance based on biomechanical proportions (shoulder span ~0.42m).
+- 17 Anatomical Keypoints: Classifies posture & entrapment severity heuristic.
 """
 
 import argparse
 import math
 import os
 import sys
-import threading
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Tuple, Union
@@ -20,6 +19,8 @@ from typing import List, Optional, Tuple, Union
 import cv2
 import numpy as np
 import onnxruntime as ort
+
+from camera_utils import ThreadedCamera, format_stream_url
 
 
 # ---------------------------------------------------------------------------
@@ -47,58 +48,11 @@ class SurvivorTarget:
     posture: str                          # PRONE_FLAT, PINNED_UPPER, CURLED, UPRIGHT
     entrapment: str                       # SEVERELY_TRAPPED, PARTIALLY_TRAPPED, EXPOSED
     bearing_deg: float                    # Relative angle: -deg (left) to +deg (right)
-    est_distance_m: float                 # Calibrated metric distance in meters
-
-
-class ThreadedCamera:
-    """Low-latency threaded stream reader for wireless phone IP cameras."""
-
-    def __init__(self, src: str):
-        print(f"[STREAM] Connecting to low-latency stream: {src}")
-        self.cap = cv2.VideoCapture(src)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        self.lock = threading.Lock()
-        self.ret = False
-        self.frame = None
-        self.running = True
-
-        if not self.cap.isOpened():
-            print(f"[ERROR] Could not open video stream: {src}")
-            self.running = False
-            return
-
-        self.thread = threading.Thread(target=self._reader, daemon=True)
-        self.thread.start()
-        print("[STREAM] Stream thread active.")
-
-    def _reader(self):
-        while self.running:
-            ret, frame = self.cap.read()
-            if not ret:
-                time.sleep(0.01)
-                continue
-            with self.lock:
-                self.ret = ret
-                self.frame = frame
-
-    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
-        with self.lock:
-            if self.frame is None:
-                return False, None
-            return self.ret, self.frame.copy()
-
-    def release(self):
-        self.running = False
-        if hasattr(self, "thread"):
-            self.thread.join(timeout=1.0)
-        self.cap.release()
-
-    def isOpened(self) -> bool:
-        return self.running and self.cap.isOpened()
+    est_distance_m: float                 # Estimated metric distance in meters
 
 
 class SurvivorDetector:
-    """High-speed survivor pose detector running on RTX 4050 GPU."""
+    """High-speed survivor pose detector running on GPU."""
 
     def __init__(self, onnx_model_path: str = "yolov8n-pose.onnx", conf_thresh: float = 0.18, iou_thresh: float = 0.60):
         print("=" * 65)
@@ -125,9 +79,9 @@ class SurvivorDetector:
         self.active_provider = self.session.get_providers()[0]
 
         if "Dml" in self.active_provider:
-            self.device_name = "NVIDIA RTX 4050 (DirectML GPU)"
+            self.device_name = "NVIDIA DirectML GPU"
         elif "CUDA" in self.active_provider:
-            self.device_name = "NVIDIA RTX 4050 (CUDA GPU)"
+            self.device_name = "NVIDIA CUDA GPU"
         else:
             self.device_name = "CPU (Fallback)"
 
@@ -154,165 +108,163 @@ class SurvivorDetector:
         return blob, r, (left, top)
 
     def detect(self, frame: np.ndarray) -> Tuple[np.ndarray, List[SurvivorTarget], float]:
+        """Runs survivor detection with exception shielding against bad frames."""
         orig_h, orig_w = frame.shape[:2]
-        blob, r, (pad_x, pad_y) = self._preprocess(frame)
 
-        # 1. Forward pass on RTX 4050 GPU
-        t0 = time.perf_counter()
-        outputs = self.session.run(None, {"images": blob})
-        latency_ms = (time.perf_counter() - t0) * 1000.0
+        try:
+            blob, r, (pad_x, pad_y) = self._preprocess(frame)
 
-        preds = outputs[0][0].T
+            # 1. Forward pass on GPU
+            t0 = time.perf_counter()
+            outputs = self.session.run(None, {"images": blob})
+            latency_ms = (time.perf_counter() - t0) * 1000.0
 
-        # 2. Filter candidates by human confidence (High Recall 0.18)
-        scores = preds[:, 4]
-        mask = scores >= self.conf_thresh
-        valid_preds = preds[mask]
+            preds = outputs[0][0].T
 
-        if len(valid_preds) == 0:
-            return frame.copy(), [], latency_ms
+            # 2. Filter candidates by human confidence (High Recall)
+            scores = preds[:, 4]
+            mask = scores >= self.conf_thresh
+            valid_preds = preds[mask]
 
-        cx = valid_preds[:, 0]
-        cy = valid_preds[:, 1]
-        bw = valid_preds[:, 2]
-        bh = valid_preds[:, 3]
+            if len(valid_preds) == 0:
+                return frame.copy(), [], latency_ms
 
-        x1 = (cx - bw / 2 - pad_x) / r
-        y1 = (cy - bh / 2 - pad_y) / r
-        w_scaled = bw / r
-        h_scaled = bh / r
+            cx = valid_preds[:, 0]
+            cy = valid_preds[:, 1]
+            bw = valid_preds[:, 2]
+            bh = valid_preds[:, 3]
 
-        x1 = np.clip(x1, 0, orig_w - 1)
-        y1 = np.clip(y1, 0, orig_h - 1)
-        w_scaled = np.clip(w_scaled, 1, orig_w)
-        h_scaled = np.clip(h_scaled, 1, orig_h)
+            x1 = (cx - bw / 2 - pad_x) / r
+            y1 = (cy - bh / 2 - pad_y) / r
+            w_scaled = bw / r
+            h_scaled = bh / r
 
-        boxes_for_nms = []
-        for i in range(len(valid_preds)):
-            boxes_for_nms.append([int(x1[i]), int(y1[i]), int(w_scaled[i]), int(h_scaled[i])])
+            x1 = np.clip(x1, 0, orig_w - 1)
+            y1 = np.clip(y1, 0, orig_h - 1)
+            w_scaled = np.clip(w_scaled, 1, orig_w)
+            h_scaled = np.clip(h_scaled, 1, orig_h)
 
-        # Overlap IoU threshold 0.60 allows adjacent teammates
-        indices = cv2.dnn.NMSBoxes(boxes_for_nms, scores[mask].tolist(), self.conf_thresh, self.iou_thresh)
+            boxes_for_nms = []
+            for i in range(len(valid_preds)):
+                boxes_for_nms.append([int(x1[i]), int(y1[i]), int(w_scaled[i]), int(h_scaled[i])])
 
-        survivors: List[SurvivorTarget] = []
-        annotated = frame.copy()
+            indices = cv2.dnn.NMSBoxes(boxes_for_nms, scores[mask].tolist(), self.conf_thresh, self.iou_thresh)
 
-        if len(indices) == 0:
-            return annotated, [], latency_ms
+            survivors: List[SurvivorTarget] = []
+            annotated = frame.copy()
 
-        indices = np.array(indices).flatten()
+            if len(indices) == 0:
+                return annotated, [], latency_ms
 
-        # Wide-angle optical focal length calibration (82° HFOV, Nothing Phone 2a lens)
-        focal_est = orig_w * 0.58
+            indices = np.array(indices).flatten()
 
-        for target_id, idx in enumerate(indices):
-            pred_row = valid_preds[idx]
-            conf = float(pred_row[4])
-            bx, by, bw_i, bh_i = boxes_for_nms[idx]
-            x2 = min(bx + bw_i, orig_w - 1)
-            y2 = min(by + bh_i, orig_h - 1)
+            # Pinhole focal approximation (~80° HFOV)
+            focal_est = orig_w * 0.60
 
-            raw_kpts = pred_row[5:].reshape(17, 3)
-            scaled_kpts = np.zeros_like(raw_kpts)
-            for k in range(17):
-                kx = (raw_kpts[k, 0] - pad_x) / r
-                ky = (raw_kpts[k, 1] - pad_y) / r
-                kc = raw_kpts[k, 2]
-                scaled_kpts[k] = [np.clip(kx, 0, orig_w - 1), np.clip(ky, 0, orig_h - 1), kc]
+            for target_id, idx in enumerate(indices):
+                pred_row = valid_preds[idx]
+                conf = float(pred_row[4])
+                bx, by, bw_i, bh_i = boxes_for_nms[idx]
+                x2 = min(bx + bw_i, orig_w - 1)
+                y2 = min(by + bh_i, orig_h - 1)
 
-            vis_joints = int(np.sum(scaled_kpts[:, 2] > 0.35))
-            aspect_ratio = bw_i / max(bh_i, 1)
+                raw_kpts = pred_row[5:].reshape(17, 3)
+                scaled_kpts = np.zeros_like(raw_kpts)
+                for k in range(17):
+                    kx = (raw_kpts[k, 0] - pad_x) / r
+                    ky = (raw_kpts[k, 1] - pad_y) / r
+                    kc = raw_kpts[k, 2]
+                    scaled_kpts[k] = [np.clip(kx, 0, orig_w - 1), np.clip(ky, 0, orig_h - 1), kc]
 
-            # Posture heuristic
-            if aspect_ratio >= 1.25:
-                posture = "PRONE_FLAT"
-            elif vis_joints <= 6:
-                posture = "PINNED_UPPER"
-            elif aspect_ratio < 0.60:
-                posture = "UPRIGHT"
-            else:
-                posture = "CURLED"
+                vis_joints = int(np.sum(scaled_kpts[:, 2] > 0.35))
+                aspect_ratio = bw_i / max(bh_i, 1)
 
-            # Entrapment severity
-            if vis_joints <= 6:
-                entrapment = "SEVERELY_TRAPPED"
-                tag_color = (0, 0, 255)       # Red alert
-            elif vis_joints <= 12:
-                entrapment = "PARTIALLY_TRAPPED"
-                tag_color = (0, 140, 255)     # Orange warning
-            else:
-                entrapment = "EXPOSED"
-                tag_color = (0, 255, 120)     # Green
+                # Posture heuristic
+                if aspect_ratio >= 1.25:
+                    posture = "PRONE_FLAT"
+                elif vis_joints <= 6:
+                    posture = "PINNED_UPPER"
+                elif aspect_ratio < 0.60:
+                    posture = "UPRIGHT"
+                else:
+                    posture = "CURLED"
 
-            # Bearing angle
-            victim_center_x = (bx + x2) / 2
-            bearing_rad = math.atan((victim_center_x - (orig_w / 2)) / focal_est)
-            bearing_deg = math.degrees(bearing_rad)
+                # Entrapment severity heuristic
+                if vis_joints <= 6:
+                    entrapment = "SEVERELY_TRAPPED"
+                    tag_color = (0, 0, 255)       # Red alert
+                elif vis_joints <= 12:
+                    entrapment = "PARTIALLY_TRAPPED"
+                    tag_color = (0, 140, 255)     # Orange warning
+                else:
+                    entrapment = "EXPOSED"
+                    tag_color = (0, 255, 120)     # Green
 
-            # Calibrated Anatomical Distance Estimation:
-            # Check shoulder span width (keypoint 5: left shoulder, 6: right shoulder)
-            has_shoulders = (scaled_kpts[5, 2] > 0.35 and scaled_kpts[6, 2] > 0.35)
-            if has_shoulders:
-                shoulder_px = math.hypot(scaled_kpts[5, 0] - scaled_kpts[6, 0], scaled_kpts[5, 1] - scaled_kpts[6, 1])
-                # Adult shoulder width is consistently ~0.42m
-                dist_from_shoulders = (focal_est * 0.42) / max(shoulder_px, 12.0)
-            else:
-                dist_from_shoulders = 999.0
+                # Bearing angle relative to camera center
+                victim_center_x = (bx + x2) / 2
+                bearing_rad = math.atan((victim_center_x - (orig_w / 2)) / focal_est)
+                bearing_deg = math.degrees(bearing_rad)
 
-            # Check full-body vs upper body height
-            has_ankles = (scaled_kpts[15, 2] > 0.35 or scaled_kpts[16, 2] > 0.35)
-            if has_ankles and posture == "UPRIGHT":
-                h_metric = 1.65  # Full standing adult
-            else:
-                h_metric = 0.85  # Torso / seated / upper body only
+                # Anthropometric Distance Estimation:
+                # Based on adult biacromial shoulder span (~0.42m)
+                has_shoulders = (scaled_kpts[5, 2] > 0.35 and scaled_kpts[6, 2] > 0.35)
+                if has_shoulders:
+                    shoulder_px = math.hypot(scaled_kpts[5, 0] - scaled_kpts[6, 0], scaled_kpts[5, 1] - scaled_kpts[6, 1])
+                    dist_from_shoulders = (focal_est * 0.42) / max(shoulder_px, 12.0)
+                else:
+                    dist_from_shoulders = 999.0
 
-            dist_from_box = (focal_est * h_metric) / max(bh_i, 18)
+                has_ankles = (scaled_kpts[15, 2] > 0.35 or scaled_kpts[16, 2] > 0.35)
+                if has_ankles and posture == "UPRIGHT":
+                    h_metric = 1.65  # Standing adult estimate
+                else:
+                    h_metric = 0.85  # Seated / upper body only
 
-            # Fuse estimates for realistic metric distance
-            if has_shoulders and dist_from_shoulders < 12.0:
-                est_distance_m = 0.65 * dist_from_shoulders + 0.35 * dist_from_box
-            else:
-                est_distance_m = dist_from_box
+                dist_from_box = (focal_est * h_metric) / max(bh_i, 18)
 
-            est_distance_m = max(0.8, min(18.0, est_distance_m))
+                if has_shoulders and dist_from_shoulders < 12.0:
+                    est_distance_m = 0.65 * dist_from_shoulders + 0.35 * dist_from_box
+                else:
+                    est_distance_m = dist_from_box
 
-            survivor = SurvivorTarget(
-                target_id=target_id + 1,
-                bbox=(bx, by, x2, y2),
-                confidence=conf,
-                keypoints=scaled_kpts,
-                visible_joints=vis_joints,
-                posture=posture,
-                entrapment=entrapment,
-                bearing_deg=bearing_deg,
-                est_distance_m=est_distance_m
-            )
-            survivors.append(survivor)
+                est_distance_m = max(0.8, min(18.0, est_distance_m))
 
-            self._render_target(annotated, survivor, tag_color)
+                survivor = SurvivorTarget(
+                    target_id=target_id + 1,
+                    bbox=(bx, by, x2, y2),
+                    confidence=conf,
+                    keypoints=scaled_kpts,
+                    visible_joints=vis_joints,
+                    posture=posture,
+                    entrapment=entrapment,
+                    bearing_deg=bearing_deg,
+                    est_distance_m=est_distance_m
+                )
+                survivors.append(survivor)
+                self._render_target(annotated, survivor, tag_color)
 
-        return annotated, survivors, latency_ms
+            return annotated, survivors, latency_ms
+
+        except Exception as e:
+            print(f"[SURVIVOR WARNING] Frame detection exception: {e}")
+            return frame.copy(), [], 0.0
 
     def _render_target(self, img: np.ndarray, s: SurvivorTarget, color: Tuple[int, int, int]):
         bx, by, x2, y2 = s.bbox
 
-        # Tactical Corner Brackets
+        # Corner Brackets
         line_len = max(15, int(min(x2 - bx, y2 - by) * 0.22))
         thickness = 2
-        # Top-Left
         cv2.line(img, (bx, by), (bx + line_len, by), color, thickness)
         cv2.line(img, (bx, by), (bx, by + line_len), color, thickness)
-        # Top-Right
         cv2.line(img, (x2, by), (x2 - line_len, by), color, thickness)
         cv2.line(img, (x2, by), (x2, by + line_len), color, thickness)
-        # Bottom-Left
         cv2.line(img, (bx, y2), (bx + line_len, y2), color, thickness)
         cv2.line(img, (bx, y2), (bx, y2 - line_len), color, thickness)
-        # Bottom-Right
         cv2.line(img, (x2, y2), (x2 - line_len, y2), color, thickness)
         cv2.line(img, (x2, y2), (x2, y2 - line_len), color, thickness)
 
-        # Render Skeletal Bones
+        # Skeletal Bones
         kpts = s.keypoints
         for p1, p2 in SKELETON_BONES:
             if kpts[p1, 2] > 0.35 and kpts[p2, 2] > 0.35:
@@ -320,14 +272,14 @@ class SurvivorDetector:
                 pt2 = (int(kpts[p2, 0]), int(kpts[p2, 1]))
                 cv2.line(img, pt1, pt2, (0, 255, 255), 2, cv2.LINE_AA)
 
-        # Render Keypoint Joint Nodes
+        # Keypoint Joint Nodes
         for k in range(17):
             if kpts[k, 2] > 0.35:
                 center = (int(kpts[k, 0]), int(kpts[k, 1]))
                 cv2.circle(img, center, 4, (0, 200, 255), -1)
                 cv2.circle(img, center, 5, (255, 255, 255), 1)
 
-        # Tactical Survivor Header Tag
+        # Survivor Header Tag
         tag_w, tag_h = 240, 52
         tag_y = max(10, by - tag_h - 4)
         tag_x = min(bx, img.shape[1] - tag_w - 10)
@@ -340,7 +292,7 @@ class SurvivorDetector:
         cv2.putText(img, f"POSTURE: {s.posture} ({s.visible_joints}/17 Joints)",
                     (tag_x + 6, tag_y + 32), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (220, 220, 220), 1, cv2.LINE_AA)
         bearing_str = f"+{s.bearing_deg:.1f}" if s.bearing_deg >= 0 else f"{s.bearing_deg:.1f}"
-        cv2.putText(img, f"BEARING: {bearing_str} deg | DIST: ~{s.est_distance_m:.1f}m",
+        cv2.putText(img, f"BEARING: {bearing_str} deg | EST DIST: ~{s.est_distance_m:.1f}m",
                     (tag_x + 6, tag_y + 46), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (0, 255, 200), 1, cv2.LINE_AA)
 
 
@@ -356,11 +308,8 @@ def run_survivor_stream(source=0, conf=0.18):
     )
 
     if is_network_stream:
-        if not (source.startswith("http://") or source.startswith("https://") or source.startswith("rtsp://")):
-            source = f"http://{source}"
-        if not source.endswith("/video") and not source.endswith(".mjpg") and not source.startswith("rtsp://"):
-            source = f"{source.rstrip('/')}/video"
-        cap = ThreadedCamera(source)
+        stream_url = format_stream_url(str(source))
+        cap = ThreadedCamera(stream_url)
         time.sleep(1.0)
     else:
         is_webcam = isinstance(source, int) or (isinstance(source, str) and source.isdigit())
@@ -404,7 +353,7 @@ def run_survivor_stream(source=0, conf=0.18):
         cv2.putText(annotated, f"GPU INFER: {gpu_latency:.1f}ms | {fps_smooth:.1f} FPS | VICTIMS: {len(survivors)}", (22, 68),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220, 220, 220), 1, cv2.LINE_AA)
 
-        cv2.imshow("USAR Survivor Identification [RTX 4050]", annotated)
+        cv2.imshow("USAR Survivor Identification", annotated)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             print("Detection session stopped by user.")

@@ -1,8 +1,8 @@
 """
 Autonomous Ground Vehicle (UGV) Real-World Traversability & Stairway Perception Engine.
-Hardware-Accelerated on NVIDIA GeForce RTX 4050 Laptop GPU via ONNX DirectML.
+Hardware-Accelerated on GPU via ONNX DirectML / CUDA.
 
-Clean semantic scene understanding (zero fake grids or synthetic artifacts):
+Clean semantic scene understanding for outdoor and indoor disaster environments:
 - GREEN (Traversable): Floors, Ground, Roads, Sidewalks, Grass, Carpets, Dirt paths
 - CYAN (Stairway): Steps, Staircases, Inclines (Navigation Incline Corridor)
 - RED (Lethal Obstacles): Walls, Columns, Desks, Chairs, Furniture, Persons
@@ -12,13 +12,14 @@ Clean semantic scene understanding (zero fake grids or synthetic artifacts):
 
 import argparse
 import sys
-import threading
 import time
 from typing import Optional, Tuple, Union
 
 import cv2
 import numpy as np
 import onnxruntime as ort
+
+from camera_utils import ThreadedCamera, format_stream_url
 
 
 # ---------------------------------------------------------------------------
@@ -69,55 +70,8 @@ COLOR_PALETTE = np.array([
 COSTMAP_LUT = np.array([0, 0, 254, 250, 80], dtype=np.uint8)
 
 
-class ThreadedCamera:
-    """Low-latency threaded stream reader to eliminate network buffer bloat."""
-
-    def __init__(self, src: str):
-        print(f"[STREAM] Connecting to video stream: {src}")
-        self.cap = cv2.VideoCapture(src)
-        self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        self.lock = threading.Lock()
-        self.ret = False
-        self.frame = None
-        self.running = True
-
-        if not self.cap.isOpened():
-            print(f"[ERROR] Could not open video stream: {src}")
-            self.running = False
-            return
-
-        self.thread = threading.Thread(target=self._reader, daemon=True)
-        self.thread.start()
-        print("[STREAM] Low-latency capture thread active.")
-
-    def _reader(self):
-        while self.running:
-            ret, frame = self.cap.read()
-            if not ret:
-                time.sleep(0.01)
-                continue
-            with self.lock:
-                self.ret = ret
-                self.frame = frame
-
-    def read(self) -> Tuple[bool, Optional[np.ndarray]]:
-        with self.lock:
-            if self.frame is None:
-                return False, None
-            return self.ret, self.frame.copy()
-
-    def release(self):
-        self.running = False
-        if hasattr(self, "thread"):
-            self.thread.join(timeout=1.0)
-        self.cap.release()
-
-    def isOpened(self) -> bool:
-        return self.running and self.cap.isOpened()
-
-
 class UGVVisionEngine:
-    """Hardware-accelerated perception engine running on RTX 4050 GPU."""
+    """Hardware-accelerated perception engine running via ONNX Runtime."""
 
     def __init__(self, onnx_model_path: str = "segformer_b0.onnx"):
         print("=" * 60)
@@ -140,9 +94,9 @@ class UGVVisionEngine:
         self.active_provider = active_providers[0]
 
         if "Dml" in self.active_provider:
-            self.device_name = "NVIDIA RTX 4050 (DirectML GPU)"
+            self.device_name = "NVIDIA DirectML GPU"
         elif "CUDA" in self.active_provider:
-            self.device_name = "NVIDIA RTX 4050 (CUDA GPU)"
+            self.device_name = "NVIDIA CUDA GPU"
         else:
             self.device_name = "CPU (Fallback)"
 
@@ -163,6 +117,10 @@ class UGVVisionEngine:
         for idx in BACKGROUND_ADE_IDS:
             self.ade_to_trav[idx] = 0
 
+        # Cache last valid results for graceful fallback
+        self._last_color_mask: Optional[np.ndarray] = None
+        self._last_costmap: Optional[np.ndarray] = None
+
         # Warm up GPU
         print("Warming up GPU kernels...")
         dummy = np.zeros((1, 3, 512, 512), dtype=np.float32)
@@ -171,7 +129,7 @@ class UGVVisionEngine:
 
     def infer(self, frame_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray, float]:
         """
-        Runs real-time inference on a BGR video frame.
+        Runs real-time inference on a BGR video frame with exception shielding.
         Returns:
             color_mask: (H, W, 3) uint8 BGR overlay
             costmap: (H, W) uint8 Nav2 costmap
@@ -179,23 +137,34 @@ class UGVVisionEngine:
         """
         orig_h, orig_w = frame_bgr.shape[:2]
 
-        resized = cv2.resize(frame_bgr, (512, 512), interpolation=cv2.INTER_LINEAR)
-        rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        norm = (rgb - self.mean) / self.std
-        tensor = np.transpose(norm, (2, 0, 1))[np.newaxis, ...]
+        try:
+            resized = cv2.resize(frame_bgr, (512, 512), interpolation=cv2.INTER_LINEAR)
+            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+            norm = (rgb - self.mean) / self.std
+            tensor = np.transpose(norm, (2, 0, 1))[np.newaxis, ...]
 
-        t0 = time.perf_counter()
-        logits = self.session.run(["logits"], {"pixel_values": tensor})[0]
-        t_gpu_infer = (time.perf_counter() - t0) * 1000.0
+            t0 = time.perf_counter()
+            logits = self.session.run(["logits"], {"pixel_values": tensor})[0]
+            t_gpu_infer = (time.perf_counter() - t0) * 1000.0
 
-        pred_grid = np.argmax(logits[0], axis=0).astype(np.uint8)  # (128, 128)
-        pred_full = cv2.resize(pred_grid, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
+            pred_grid = np.argmax(logits[0], axis=0).astype(np.uint8)  # (128, 128)
+            pred_full = cv2.resize(pred_grid, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST)
 
-        trav_mask = self.ade_to_trav[pred_full]
-        color_mask = COLOR_PALETTE[trav_mask]
-        costmap = COSTMAP_LUT[trav_mask]
+            trav_mask = self.ade_to_trav[pred_full]
+            color_mask = COLOR_PALETTE[trav_mask]
+            costmap = COSTMAP_LUT[trav_mask]
 
-        return color_mask, costmap, t_gpu_infer
+            self._last_color_mask = color_mask
+            self._last_costmap = costmap
+            return color_mask, costmap, t_gpu_infer
+
+        except Exception as e:
+            print(f"[PERCEPTION WARNING] Frame inference dropped: {e}")
+            if self._last_color_mask is not None and self._last_color_mask.shape[:2] == (orig_h, orig_w):
+                return self._last_color_mask, self._last_costmap, 0.0
+            fallback_mask = np.zeros((orig_h, orig_w, 3), dtype=np.uint8)
+            fallback_cost = np.zeros((orig_h, orig_w), dtype=np.uint8)
+            return fallback_mask, fallback_cost, 0.0
 
 
 def run_pipeline(source=0, alpha: float = 0.35):
@@ -210,13 +179,9 @@ def run_pipeline(source=0, alpha: float = 0.35):
     )
 
     if is_network_stream:
-        if not (source.startswith("http://") or source.startswith("https://") or source.startswith("rtsp://")):
-            source = f"http://{source}"
-        if not source.endswith("/video") and not source.endswith(".mjpg") and not source.startswith("rtsp://"):
-            source = f"{source.rstrip('/')}/video"
-
-        print(f"[INIT] Opening low-latency wireless stream: {source}")
-        cap = ThreadedCamera(source)
+        stream_url = format_stream_url(str(source))
+        print(f"[INIT] Opening low-latency wireless stream: {stream_url}")
+        cap = ThreadedCamera(stream_url)
         time.sleep(1.0)
     else:
         is_webcam = isinstance(source, int) or (isinstance(source, str) and source.isdigit())
@@ -249,7 +214,7 @@ def run_pipeline(source=0, alpha: float = 0.35):
 
         color_mask, costmap, gpu_latency = engine.infer(frame)
 
-        # Smooth, clean alpha-blend over camera feed (zero fake neon grids)
+        # Smooth, clean alpha-blend over camera feed
         blended = cv2.addWeighted(color_mask, alpha, frame, 1.0 - alpha, 0)
 
         t_total = time.perf_counter() - t_frame_start
@@ -296,7 +261,7 @@ def run_pipeline(source=0, alpha: float = 0.35):
         cv2.rectangle(blended, (300, leg_y - 12), (312, leg_y), (70, 70, 70), -1)
         cv2.putText(blended, "Ceiling", (318, leg_y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1)
 
-        cv2.imshow("Autonomous Traversability Perception [RTX 4050]", blended)
+        cv2.imshow("Autonomous Traversability Perception", blended)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             print("Perception session stopped by user.")
@@ -307,7 +272,7 @@ def run_pipeline(source=0, alpha: float = 0.35):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Autonomous Traversability Engine on RTX 4050")
+    parser = argparse.ArgumentParser(description="Autonomous Traversability Engine")
     parser.add_argument("--url", type=str, default=None, help="Wireless Phone IP Webcam URL")
     parser.add_argument("--webcam", type=int, default=0, help="Webcam device ID (default: 0)")
     parser.add_argument("--video", type=str, default=None, help="Path to video file")
