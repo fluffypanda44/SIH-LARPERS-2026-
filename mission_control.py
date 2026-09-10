@@ -326,6 +326,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     v_src = args.url if args.url else (args.video if args.video else args.webcam)
-    a_src = args.audio_url if args.audio_url else (args.url if args.url else None)
+    # Default to laptop's built-in hardware stereo mic array for true Left/Right sound localization
+    a_src = args.audio_url
 
     run_mission_control(video_source=v_src, audio_url=a_src, alpha=args.alpha, udp_port=args.udp_port)
