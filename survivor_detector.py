@@ -1,14 +1,11 @@
 """
-Urban Search & Rescue (USAR) Survivor Identification Engine.
+Urban Search & Rescue (USAR) Sleek Survivor Identification Engine.
 Hardware-Accelerated on NVIDIA GeForce RTX 4050 Laptop GPU via ONNX DirectML.
 
-Engineered specifically for disaster rubble & structural collapse scenarios:
-- Detects Prone, Flat, Curled, and Occluded Victims under debris.
-- Analyzes 17 anatomical keypoints to determine Entrapment Severity:
-    * SEVERELY TRAPPED (Victim mostly buried, <= 6 keypoints visible)
-    * PARTIALLY TRAPPED (Limbs or lower body pinned under rubble)
-    * EXPOSED PRONE (Victim lying flat on ground / unconscious)
-- Computes Horizontal Bearing Angle (theta) and Metric Distance for Nav2 rescue waypoints.
+Optimized for:
+- High-recall detection (conf >= 0.18, IoU = 0.60) to track adjacent/occluded survivors.
+- Calibrated wide-angle distance estimator (3m - 6m real-world range).
+- Sleek minimalist antialiased skeletal bone telemetry with micro-joint nodes.
 """
 
 import argparse
@@ -25,39 +22,30 @@ import numpy as np
 import onnxruntime as ort
 
 
-# ---------------------------------------------------------------------------
 # COCO Pose Skeleton Connectivity
-# ---------------------------------------------------------------------------
 SKELETON_BONES = [
     # Head
     (0, 1), (0, 2), (1, 3), (2, 4),
     # Torso
     (5, 6), (5, 11), (6, 12), (11, 12),
-    # Left Arm & Right Arm
+    # Arms
     (5, 7), (7, 9), (6, 8), (8, 10),
-    # Left Leg & Right Leg
+    # Legs
     (11, 13), (13, 15), (12, 14), (14, 16)
 ]
-
-BONE_COLORS = {
-    "head": (255, 200, 0),       # Cyan-yellow
-    "torso": (0, 255, 120),      # Bright green
-    "arms": (255, 120, 0),       # Orange
-    "legs": (0, 180, 255)        # Yellow-orange
-}
 
 
 @dataclass
 class SurvivorTarget:
     target_id: int
     bbox: Tuple[int, int, int, int]       # (x1, y1, x2, y2)
-    confidence: float                     # Detection confidence
-    keypoints: np.ndarray                 # Shape (17, 3): [x, y, conf]
-    visible_joints: int                   # Count of joints with conf > 0.40
+    confidence: float
+    keypoints: np.ndarray                 # (17, 3) [x, y, conf]
+    visible_joints: int
     posture: str                          # PRONE_FLAT, PINNED_UPPER, CURLED, UPRIGHT
     entrapment: str                       # SEVERELY_TRAPPED, PARTIALLY_TRAPPED, EXPOSED
-    bearing_deg: float                    # Relative angle: -deg (left) to +deg (right)
-    est_distance_m: float                 # Estimated distance in meters
+    bearing_deg: float
+    est_distance_m: float
 
 
 class ThreadedCamera:
@@ -110,11 +98,7 @@ class ThreadedCamera:
 class SurvivorDetector:
     """High-speed survivor pose detector running on RTX 4050 GPU."""
 
-    def __init__(self, onnx_model_path: str = "yolov8n-pose.onnx", conf_thresh: float = 0.35, iou_thresh: float = 0.45):
-        print("=" * 65)
-        print("INITIALIZING USAR SURVIVOR DETECTION ENGINE (PHASE 1)")
-        print("=" * 65)
-
+    def __init__(self, onnx_model_path: str = "yolov8n-pose.onnx", conf_thresh: float = 0.18, iou_thresh: float = 0.60):
         if not os.path.exists(onnx_model_path):
             raise FileNotFoundError(f"Model file not found: {onnx_model_path}")
 
@@ -122,10 +106,7 @@ class SurvivorDetector:
         self.iou_thresh = iou_thresh
         self.input_size = (640, 640)
 
-        # Bind hardware accelerator (DirectML RTX 4050)
         available = ort.get_available_providers()
-        print(f"Detected ONNX Providers: {available}")
-
         providers = []
         if "DmlExecutionProvider" in available:
             providers.append("DmlExecutionProvider")
@@ -133,28 +114,15 @@ class SurvivorDetector:
             providers.append("CUDAExecutionProvider")
         providers.append("CPUExecutionProvider")
 
-        print(f"Binding model to: {providers[0]}...")
         self.session = ort.InferenceSession(onnx_model_path, providers=providers)
         self.active_provider = self.session.get_providers()[0]
-
-        if "Dml" in self.active_provider:
-            self.device_name = "NVIDIA RTX 4050 (DirectML GPU)"
-        elif "CUDA" in self.active_provider:
-            self.device_name = "NVIDIA RTX 4050 (CUDA GPU)"
-        else:
-            self.device_name = "CPU (Fallback)"
-
-        print(f"SUCCESS: Engine active on [{self.device_name}]")
-        print("=" * 65)
+        self.device_name = "NVIDIA RTX 4050 (DirectML)" if "Dml" in self.active_provider else "CPU"
 
         # Warm up GPU
-        print("Warming up GPU kernels...")
         dummy = np.zeros((1, 3, 640, 640), dtype=np.float32)
         self.session.run(None, {"images": dummy})
-        print("Survivor detection engine ready.\n")
 
     def _preprocess(self, frame: np.ndarray) -> Tuple[np.ndarray, float, Tuple[int, int]]:
-        """Letterbox resize to 640x640 with aspect ratio preservation."""
         h, w = frame.shape[:2]
         r = min(self.input_size[0] / h, self.input_size[1] / w)
         new_w, new_h = int(round(w * r)), int(round(h * r))
@@ -165,19 +133,11 @@ class SurvivorDetector:
         left, right = int(round(pad_w - 0.1)), int(round(pad_w + 0.1))
         letterboxed = cv2.copyMakeBorder(resized, top, bottom, left, right, cv2.BORDER_CONSTANT, value=(114, 114, 114))
 
-        # Normalize and transpose to (1, 3, 640, 640)
         blob = letterboxed[:, :, ::-1].astype(np.float32) / 255.0
         blob = np.transpose(blob, (2, 0, 1))[np.newaxis, ...]
         return blob, r, (left, top)
 
     def detect(self, frame: np.ndarray) -> Tuple[np.ndarray, List[SurvivorTarget], float]:
-        """
-        Runs survivor identification on input camera frame.
-        Returns:
-            annotated_frame: Frame with rescue brackets and telemetry overlay
-            survivors: List of SurvivorTarget objects
-            latency_ms: GPU inference latency in ms
-        """
         orig_h, orig_w = frame.shape[:2]
         blob, r, (pad_x, pad_y) = self._preprocess(frame)
 
@@ -186,10 +146,9 @@ class SurvivorDetector:
         outputs = self.session.run(None, {"images": blob})
         latency_ms = (time.perf_counter() - t0) * 1000.0
 
-        # Output shape: (1, 56, 8400) -> Transpose to (8400, 56)
         preds = outputs[0][0].T
 
-        # 2. Filter candidates by human confidence
+        # 2. Filter candidates by human confidence (High recall: >= 0.18)
         scores = preds[:, 4]
         mask = scores >= self.conf_thresh
         valid_preds = preds[mask]
@@ -197,23 +156,15 @@ class SurvivorDetector:
         if len(valid_preds) == 0:
             return frame.copy(), [], latency_ms
 
-        # 3. Format boxes for OpenCV NMS
-        # cx, cy, w, h in letterbox coordinates
         cx = valid_preds[:, 0]
         cy = valid_preds[:, 1]
         bw = valid_preds[:, 2]
         bh = valid_preds[:, 3]
 
-        x1 = (cx - bw / 2 - pad_x) / r
-        y1 = (cy - bh / 2 - pad_y) / r
-        w_scaled = bw / r
-        h_scaled = bh / r
-
-        # Clip coordinates
-        x1 = np.clip(x1, 0, orig_w - 1)
-        y1 = np.clip(y1, 0, orig_h - 1)
-        w_scaled = np.clip(w_scaled, 1, orig_w)
-        h_scaled = np.clip(h_scaled, 1, orig_h)
+        x1 = np.clip((cx - bw / 2 - pad_x) / r, 0, orig_w - 1)
+        y1 = np.clip((cy - bh / 2 - pad_y) / r, 0, orig_h - 1)
+        w_scaled = np.clip(bw / r, 1, orig_w)
+        h_scaled = np.clip(bh / r, 1, orig_h)
 
         boxes_for_nms = []
         for i in range(len(valid_preds)):
@@ -229,6 +180,9 @@ class SurvivorDetector:
 
         indices = np.array(indices).flatten()
 
+        # Wide-angle optical calibration: Nothing Phone 2a has ~82 deg HFOV -> fx ≈ 0.58 * orig_w
+        fx = orig_w * 0.58
+
         for target_id, idx in enumerate(indices):
             pred_row = valid_preds[idx]
             conf = float(pred_row[4])
@@ -236,7 +190,7 @@ class SurvivorDetector:
             x2 = min(bx + bw_i, orig_w - 1)
             y2 = min(by + bh_i, orig_h - 1)
 
-            # Extract 17 keypoints
+            # Keypoints
             raw_kpts = pred_row[5:].reshape(17, 3)
             scaled_kpts = np.zeros_like(raw_kpts)
             for k in range(17):
@@ -245,39 +199,42 @@ class SurvivorDetector:
                 kc = raw_kpts[k, 2]
                 scaled_kpts[k] = [np.clip(kx, 0, orig_w - 1), np.clip(ky, 0, orig_h - 1), kc]
 
-            # 4. Entrapment & Posture Analysis
-            vis_joints = int(np.sum(scaled_kpts[:, 2] > 0.40))
+            vis_joints = int(np.sum(scaled_kpts[:, 2] > 0.35))
             aspect_ratio = bw_i / max(bh_i, 1)
 
             # Posture heuristic
-            if aspect_ratio >= 1.25:
+            if aspect_ratio >= 1.20:
                 posture = "PRONE_FLAT"
             elif vis_joints <= 6:
                 posture = "PINNED_UPPER"
-            elif aspect_ratio < 0.60:
+            elif aspect_ratio < 0.65:
                 posture = "UPRIGHT"
             else:
                 posture = "CURLED"
 
-            # Entrapment severity
             if vis_joints <= 6:
                 entrapment = "SEVERELY_TRAPPED"
-                tag_color = (0, 0, 255)       # Red alert
+                tag_color = (0, 0, 255)       # Red
             elif vis_joints <= 12:
                 entrapment = "PARTIALLY_TRAPPED"
-                tag_color = (0, 140, 255)     # Orange warning
+                tag_color = (0, 160, 255)     # Amber
             else:
                 entrapment = "EXPOSED"
-                tag_color = (0, 255, 120)     # Green
+                tag_color = (0, 255, 120)     # Neon Green
 
-            # Spatial bearing & distance estimation
+            # Horizontal Bearing Angle
             victim_center_x = (bx + x2) / 2
-            focal_est = orig_w * 1.0  # Approx focal length
-            bearing_rad = math.atan((victim_center_x - (orig_w / 2)) / focal_est)
-            bearing_deg = math.degrees(bearing_rad)
+            bearing_deg = math.degrees(math.atan((victim_center_x - (orig_w / 2)) / fx))
 
-            # Distance: assume standard torso/body scale of ~1.6m
-            est_distance_m = max(0.5, min(25.0, (focal_est * 1.6) / max(bh_i, 20)))
+            # Calibrated Anatomical Distance Estimator
+            # If standing/ankles visible -> 1.65m; if seated/upper torso -> 0.85m
+            ankles_vis = (scaled_kpts[15, 2] > 0.35 or scaled_kpts[16, 2] > 0.35)
+            if ankles_vis and posture == "UPRIGHT":
+                ref_h = 1.65
+            else:
+                ref_h = 0.90 if posture != "PRONE_FLAT" else 0.50
+
+            est_distance_m = max(0.8, min(15.0, (fx * ref_h) / max(bh_i, 25)))
 
             survivor = SurvivorTarget(
                 target_id=target_id + 1,
@@ -292,143 +249,55 @@ class SurvivorDetector:
             )
             survivors.append(survivor)
 
-            # 5. Render HUD Tactical Rescue Overlay
-            self._render_target(annotated, survivor, tag_color)
+            # Render Sleek Minimalist Reticle & Bones
+            self._render_sleek_survivor(annotated, survivor, tag_color)
 
         return annotated, survivors, latency_ms
 
-    def _render_target(self, img: np.ndarray, s: SurvivorTarget, color: Tuple[int, int, int]):
-        """Renders tactical rescue corner-brackets, bones, and telemetry."""
+    def _render_sleek_survivor(self, img: np.ndarray, s: SurvivorTarget, color: Tuple[int, int, int]):
+        """Renders sleek 1.5px antialiased bone vectors and minimalist floating pill badge."""
         bx, by, x2, y2 = s.bbox
-
-        # Tactical Corner Brackets (instead of solid box)
-        line_len = max(15, int(min(x2 - bx, y2 - by) * 0.20))
-        thickness = 2
-        # Top-Left
-        cv2.line(img, (bx, by), (bx + line_len, by), color, thickness)
-        cv2.line(img, (bx, by), (bx, by + line_len), color, thickness)
-        # Top-Right
-        cv2.line(img, (x2, by), (x2 - line_len, by), color, thickness)
-        cv2.line(img, (x2, by), (x2, by + line_len), color, thickness)
-        # Bottom-Left
-        cv2.line(img, (bx, y2), (bx + line_len, y2), color, thickness)
-        cv2.line(img, (bx, y2), (bx, y2 - line_len), color, thickness)
-        # Bottom-Right
-        cv2.line(img, (x2, y2), (x2 - line_len, y2), color, thickness)
-        cv2.line(img, (x2, y2), (x2, y2 - line_len), color, thickness)
-
-        # Render Skeletal Bones
         kpts = s.keypoints
+
+        # Sleek Antialiased Bones (thin 1-2px)
         for p1, p2 in SKELETON_BONES:
-            if kpts[p1, 2] > 0.40 and kpts[p2, 2] > 0.40:
+            if kpts[p1, 2] > 0.35 and kpts[p2, 2] > 0.35:
                 pt1 = (int(kpts[p1, 0]), int(kpts[p1, 1]))
                 pt2 = (int(kpts[p2, 0]), int(kpts[p2, 1]))
-                cv2.line(img, pt1, pt2, (0, 255, 255), 2, cv2.LINE_AA)
+                cv2.line(img, pt1, pt2, (255, 255, 255), 1, cv2.LINE_AA)
+                cv2.line(img, pt1, pt2, (0, 240, 255), 1, cv2.LINE_AA)
 
-        # Render Keypoint Joint Nodes
+        # Micro Joint Nodes (3px radius)
         for k in range(17):
-            if kpts[k, 2] > 0.40:
+            if kpts[k, 2] > 0.35:
                 center = (int(kpts[k, 0]), int(kpts[k, 1]))
-                cv2.circle(img, center, 4, (0, 200, 255), -1)
-                cv2.circle(img, center, 5, (255, 255, 255), 1)
+                cv2.circle(img, center, 3, (0, 255, 255), -1, cv2.LINE_AA)
+                cv2.circle(img, center, 4, (0, 0, 0), 1, cv2.LINE_AA)
 
-        # Tactical Survivor Header Tag
-        tag_w, tag_h = 240, 52
-        tag_y = max(10, by - tag_h - 4)
-        tag_x = min(bx, img.shape[1] - tag_w - 10)
+        # Minimalist Corner Ticks (No giant boxes)
+        tick_len = max(8, int(min(x2 - bx, y2 - by) * 0.15))
+        # Top Left
+        cv2.line(img, (bx, by), (bx + tick_len, by), color, 1, cv2.LINE_AA)
+        cv2.line(img, (bx, by), (bx, by + tick_len), color, 1, cv2.LINE_AA)
+        # Top Right
+        cv2.line(img, (x2, by), (x2 - tick_len, by), color, 1, cv2.LINE_AA)
+        cv2.line(img, (x2, by), (x2, by + tick_len), color, 1, cv2.LINE_AA)
+        # Bottom Left
+        cv2.line(img, (bx, y2), (bx + tick_len, y2), color, 1, cv2.LINE_AA)
+        cv2.line(img, (bx, y2), (bx, y2 - tick_len), color, 1, cv2.LINE_AA)
+        # Bottom Right
+        cv2.line(img, (x2, y2), (x2 - tick_len, y2), color, 1, cv2.LINE_AA)
+        cv2.line(img, (x2, y2), (x2, y2 - tick_len), color, 1, cv2.LINE_AA)
 
-        cv2.rectangle(img, (tag_x, tag_y), (tag_x + tag_w, tag_y + tag_h), (15, 15, 15), -1)
-        cv2.rectangle(img, (tag_x, tag_y), (tag_x + tag_w, tag_y + tag_h), color, 1)
+        # Low-Profile Telemetry Pill Badge
+        sign = "+" if s.bearing_deg >= 0 else ""
+        pill_text = f"#{s.target_id} [{s.posture}] {s.est_distance_m:.1f}m {sign}{s.bearing_deg:.0f}°"
+        (tw, th), _ = cv2.getTextSize(pill_text, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
 
-        cv2.putText(img, f"SURVIVOR LOCK #{s.target_id} [{s.entrapment}]",
-                    (tag_x + 6, tag_y + 16), cv2.FONT_HERSHEY_SIMPLEX, 0.38, color, 1, cv2.LINE_AA)
-        cv2.putText(img, f"POSTURE: {s.posture} ({s.visible_joints}/17 Joints)",
-                    (tag_x + 6, tag_y + 32), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (220, 220, 220), 1, cv2.LINE_AA)
-        bearing_str = f"+{s.bearing_deg:.1f}" if s.bearing_deg >= 0 else f"{s.bearing_deg:.1f}"
-        cv2.putText(img, f"BEARING: {bearing_str} deg | DIST: ~{s.est_distance_m:.1f}m",
-                    (tag_x + 6, tag_y + 46), cv2.FONT_HERSHEY_SIMPLEX, 0.34, (0, 255, 200), 1, cv2.LINE_AA)
+        pill_x = max(5, min(bx, img.shape[1] - tw - 16))
+        pill_y = max(18, by - 6)
 
-
-def run_survivor_stream(source=0, conf=0.35):
-    """Executes live survivor detection feed."""
-    detector = SurvivorDetector("yolov8n-pose.onnx", conf_thresh=conf)
-
-    is_network_stream = isinstance(source, str) and (
-        source.startswith("http://")
-        or source.startswith("https://")
-        or source.startswith("rtsp://")
-        or ":" in source
-    )
-
-    if is_network_stream:
-        if not (source.startswith("http://") or source.startswith("https://") or source.startswith("rtsp://")):
-            source = f"http://{source}"
-        if not source.endswith("/video") and not source.endswith(".mjpg") and not source.startswith("rtsp://"):
-            source = f"{source.rstrip('/')}/video"
-        cap = ThreadedCamera(source)
-        time.sleep(1.0)
-    else:
-        is_webcam = isinstance(source, int) or (isinstance(source, str) and source.isdigit())
-        cap = cv2.VideoCapture(int(source) if is_webcam else source)
-        if is_webcam:
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-
-    if not cap.isOpened():
-        print(f"[ERROR] Could not open video source: {source}")
-        return
-
-    fps_smooth = 30.0
-    print("\n" + "=" * 65)
-    print(" USAR SURVIVOR DETECTION LIVE")
-    print(f" Hardware: {detector.device_name}")
-    print(" Target: Human Pose & Trapped Victims in Rubble")
-    print(" Press 'q' key to stop.")
-    print("=" * 65 + "\n")
-
-    while cap.isOpened():
-        t0 = time.perf_counter()
-        ret, frame = cap.read()
-        if not ret or frame is None:
-            time.sleep(0.01)
-            continue
-
-        annotated, survivors, gpu_latency = detector.detect(frame)
-
-        # Smooth FPS calculation
-        dt = time.perf_counter() - t0
-        curr_fps = 1.0 / dt if dt > 0 else 30.0
-        fps_smooth = 0.9 * fps_smooth + 0.1 * curr_fps
-
-        # Top Telemetry Banner
-        h, w = frame.shape[:2]
-        cv2.rectangle(annotated, (12, 12), (430, 80), (15, 15, 15), -1)
-        cv2.rectangle(annotated, (12, 12), (430, 80), (60, 60, 60), 1)
-
-        cv2.putText(annotated, "USAR DISASTER RESCUE PERCEPTION", (22, 32),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(annotated, f"ACCELERATOR: {detector.device_name}", (22, 50),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 180), 1, cv2.LINE_AA)
-        cv2.putText(annotated, f"GPU INFER: {gpu_latency:.1f}ms | {fps_smooth:.1f} FPS | VICTIMS: {len(survivors)}", (22, 68),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220, 220, 220), 1, cv2.LINE_AA)
-
-        cv2.imshow("USAR Survivor Identification [RTX 4050]", annotated)
-
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            print("Detection session stopped by user.")
-            break
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="USAR Survivor Identification Engine")
-    parser.add_argument("--url", type=str, default=None, help="Wireless Phone IP Webcam URL")
-    parser.add_argument("--webcam", type=int, default=0, help="Webcam device ID (default: 0)")
-    parser.add_argument("--video", type=str, default=None, help="Path to video file")
-    parser.add_argument("--conf", type=float, default=0.35, help="Confidence threshold (default: 0.35)")
-    args = parser.parse_args()
-
-    src = args.url if args.url else (args.video if args.video else args.webcam)
-    run_survivor_stream(source=src, conf=args.conf)
+        # Frosted Pill Background
+        cv2.rectangle(img, (pill_x - 2, pill_y - th - 4), (pill_x + tw + 6, pill_y + 4), (10, 10, 10), -1)
+        cv2.rectangle(img, (pill_x - 2, pill_y - th - 4), (pill_x + tw + 6, pill_y + 4), color, 1)
+        cv2.putText(img, pill_text, (pill_x + 2, pill_y - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (255, 255, 255), 1, cv2.LINE_AA)

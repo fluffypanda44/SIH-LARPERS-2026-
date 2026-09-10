@@ -2,16 +2,13 @@
 Urban Search & Rescue (USAR) Unified Autonomous Mission Control Engine.
 Hardware-Accelerated on NVIDIA GeForce RTX 4050 Laptop GPU via ONNX DirectML.
 
-Fuses:
-1. Ground / Rubble Traversability Perception (SegFormer-B0 DirectML)
-2. Trapped Survivor Keypoint & Posture Detection (YOLOv8-Pose DirectML)
-3. Acoustic Voice Direction of Arrival (GCC-PHAT Microphone Array)
-4. Autonomous Navigation Waypoint & Robot Steering Dispatcher (Nav2 Compatible)
-
-Supports:
-- Local Webcams / USB Cameras
-- Wireless Phone IP Webcam Streams (--url http://<IP>:8080)
-- Recorded Disaster Video Files (--video <path>)
+Integrated Features:
+1. Neon Green Drivable Spatial Ground Grid (preserves floor texture)
+2. Dedicated Stairway & Incline Corridor Perception (Electric Cyan)
+3. Sleek Minimalist Survivor Skeleton & Calibrated Metric Distance (3m - 6m)
+4. Acoustic Camera Projection: Vertical Sound Beacon mapped directly onto video pixels!
+5. High-Contrast Sonar Radar & Nav2 Costmap
+6. Autonomous Navigation Dispatcher (Nav2 Waypoints)
 """
 
 import argparse
@@ -25,7 +22,6 @@ from typing import List, Optional, Tuple, Union
 import cv2
 import numpy as np
 
-# Import our modular engines
 from acoustic_doa import AcousticDoAEngine, AcousticTarget, render_acoustic_compass
 from real_vision import UGVVisionEngine
 from survivor_detector import SurvivorDetector, SurvivorTarget, ThreadedCamera
@@ -33,16 +29,14 @@ from survivor_detector import SurvivorDetector, SurvivorTarget, ThreadedCamera
 
 @dataclass
 class AutonomousNavCommand:
-    mode: str                    # "VISUAL_SURVIVOR_LOCK", "ACOUSTIC_HOMING", "PATROL_STABLE_SLAB"
-    target_heading_deg: float    # Desired steering angle (-90° to +90°)
-    target_distance_m: float     # Estimated distance
-    recommended_speed: float     # Linear speed m/s
-    action_text: str             # Human readable mission dispatch command
+    mode: str                    # "SURVIVOR_INTERCEPT", "ACOUSTIC_HOMING", "PATROL_STABLE_SLAB"
+    target_heading_deg: float
+    target_distance_m: float
+    recommended_speed: float
+    action_text: str
 
 
 class AutonomousNavigator:
-    """Computes real-time navigation dispatch commands based on multi-modal sensory input."""
-
     def __init__(self):
         self.last_audio_heading = 0.0
 
@@ -52,9 +46,7 @@ class AutonomousNavigator:
         acoustic_target: AcousticTarget,
         costmap: np.ndarray,
     ) -> AutonomousNavCommand:
-        # Priority 1: Visual Survivor Lock (Line-of-Sight)
         if len(survivors) > 0:
-            # Sort by highest entrapment priority / proximity
             target = survivors[0]
             heading = target.bearing_deg
             dist = target.est_distance_m
@@ -62,12 +54,12 @@ class AutonomousNavigator:
             if dist <= 1.2:
                 mode = "RESCUE_STATIONARY"
                 speed = 0.0
-                action = f"HALT: SURVIVOR AT {dist:.1f}m | LOCK BRAKES & SIGNAL CREW"
+                action = f"HALT: SURVIVOR AT {dist:.1f}m | LOCK BRAKES & SIGNAL RESCUE TEAM"
             else:
-                mode = "VISUAL_SURVIVOR_LOCK"
-                speed = 0.65 if target.entrapment == "EXPOSED" else 0.40
+                mode = "SURVIVOR_INTERCEPT"
+                speed = 0.60
                 turn_dir = "RIGHT" if heading > 0 else "LEFT"
-                action = f"APPROACH SURVIVOR #{target.target_id} [{target.posture}]: STEER {abs(heading):.1f}° {turn_dir} | ADVANCE {dist:.1f}m"
+                action = f"APPROACH #{target.target_id} [{target.posture}]: STEER {abs(heading):.1f}° {turn_dir} | ADVANCE {dist:.1f}m"
 
             return AutonomousNavCommand(
                 mode=mode,
@@ -77,61 +69,83 @@ class AutonomousNavigator:
                 action_text=action,
             )
 
-        # Priority 2: Acoustic Homing (Trapped sound behind debris / Non-Line-of-Sight)
         if acoustic_target.is_active and acoustic_target.confidence > 0.35:
             self.last_audio_heading = acoustic_target.azimuth_deg
             turn_dir = "RIGHT" if self.last_audio_heading > 0 else "LEFT"
             return AutonomousNavCommand(
                 mode="ACOUSTIC_HOMING",
                 target_heading_deg=self.last_audio_heading,
-                target_distance_m=5.0,
+                target_distance_m=4.0,
                 recommended_speed=0.35,
-                action_text=f"ACOUSTIC HOMING: ROTATE {abs(self.last_audio_heading):.1f}° {turn_dir} TOWARDS DISTRESS SOUND",
+                action_text=f"ACOUSTIC HOMING: ROTATE {abs(self.last_audio_heading):.1f}° {turn_dir} TOWARDS CRY",
             )
-
-        # Priority 3: Autonomous Patrol on Safe Rubble / Slabs
-        # Check forward path in costmap (center bottom 20%)
-        h, w = costmap.shape[:2]
-        forward_sector = costmap[int(h * 0.70):, int(w * 0.35):int(w * 0.65)]
-        mean_cost = float(np.mean(forward_sector)) if forward_sector.size > 0 else 0.0
-
-        if mean_cost > 150:
-            action = "OBSTACLE DETECTED IN FRONT: SCANNING ALTERNATE CORRIDOR"
-            speed = 0.0
-            heading = 25.0
-        else:
-            action = "SECTOR PATROL: FORWARD PATH CLEAR ON STABLE GROUND"
-            speed = 0.80
-            heading = 0.0
 
         return AutonomousNavCommand(
             mode="PATROL_STABLE_SLAB",
-            target_heading_deg=heading,
-            target_distance_m=10.0,
-            recommended_speed=speed,
-            action_text=action,
+            target_heading_deg=0.0,
+            target_distance_m=8.0,
+            recommended_speed=0.75,
+            action_text="AUTONOMOUS PATROL: ADVANCING ON STABLE GROUND GRID",
         )
+
+
+def render_acoustic_camera_beacon(img: np.ndarray, target: AcousticTarget, fx: float):
+    """
+    Acoustic Camera: Maps sound bearing angle theta directly to a vertical energy beacon
+    over the exact video pixel column where the sound originates!
+    """
+    if not target.is_active:
+        return
+
+    h, w = img.shape[:2]
+    # Projected pixel column: X_sound = W/2 + fx * tan(theta)
+    rad = math.radians(target.azimuth_deg)
+    x_sound = int((w / 2) + fx * math.tan(rad))
+
+    if 0 <= x_sound < w:
+        beam_w = 40
+        x1 = max(0, x_sound - beam_w // 2)
+        x2 = min(w - 1, x_sound + beam_w // 2)
+
+        # Translucent vertical acoustic energy column
+        overlay = img.copy()
+        cv2.rectangle(overlay, (x1, 0), (x2, h), (0, 255, 200), -1)
+        cv2.addWeighted(overlay, 0.22, img, 0.78, 0, img)
+
+        # Center laser line
+        cv2.line(img, (x_sound, 0), (x_sound, h), (0, 255, 255), 2, cv2.LINE_AA)
+
+        # Tactical Beacon Badge (Top of column)
+        badge_y = 95
+        sign = "+" if target.azimuth_deg >= 0 else ""
+        badge_text = f"ACOUSTIC BEACON: {sign}{target.azimuth_deg:.0f}° ({target.energy_db:.0f} dB)"
+        (bw, bh), _ = cv2.getTextSize(badge_text, cv2.FONT_HERSHEY_SIMPLEX, 0.38, 1)
+
+        bx = max(10, min(x_sound - bw // 2, w - bw - 15))
+        cv2.rectangle(img, (bx - 4, badge_y - bh - 4), (bx + bw + 6, badge_y + 6), (15, 15, 15), -1)
+        cv2.rectangle(img, (bx - 4, badge_y - bh - 4), (bx + bw + 6, badge_y + 6), (0, 255, 255), 1)
+        cv2.putText(img, badge_text, (bx, badge_y), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 255), 1, cv2.LINE_AA)
 
 
 def run_mission_control(
     video_source: Union[int, str] = 0,
     audio_url: Optional[str] = None,
-    alpha: float = 0.40,
+    alpha: float = 0.35,
 ):
     print("\n" + "=" * 70)
     print(" LAUNCHING USAR UNIFIED AUTONOMOUS MISSION CONTROL")
-    print(" Hardware Acceleration: NVIDIA GeForce RTX 4050 (DirectML)")
+    print(" Hardware Acceleration: NVIDIA GeForce RTX 4050 (DirectML Dual AI)")
     print("=" * 70)
 
-    # 1. Initialize Dual AI Engines on RTX 4050
-    vision_engine = UGVVisionEngine("segformer_b0.onnx")
-    survivor_detector = SurvivorDetector("yolov8n-pose.onnx", conf_thresh=0.30)
-    navigator = AutonomousNavigator()
+    # Auto-route audio if user passed --url and did not set audio_url
+    if isinstance(video_source, str) and video_source.startswith("http://") and audio_url is None:
+        audio_url = video_source
 
-    # 2. Initialize Audio DoA Engine
+    vision_engine = UGVVisionEngine("segformer_b0.onnx")
+    survivor_detector = SurvivorDetector("yolov8n-pose.onnx", conf_thresh=0.18, iou_thresh=0.60)
+    navigator = AutonomousNavigator()
     audio_engine = AcousticDoAEngine(url=audio_url, mic_distance_m=0.16)
 
-    # 3. Initialize Video Ingestion
     is_network_stream = isinstance(video_source, str) and (
         video_source.startswith("http://")
         or video_source.startswith("https://")
@@ -160,17 +174,15 @@ def run_mission_control(
         return
 
     fps_smooth = 30.0
-    show_traversability = True
-    show_survivors = True
-    show_radar = True
 
     print("\n" + "=" * 70)
     print(" USAR MISSION CONTROL ACTIVE")
-    print(" Controls:")
-    print("   - Press 'q' to exit")
-    print("   - Press 't' to toggle Traversability Mask")
-    print("   - Press 's' to toggle Survivor Detection")
-    print("   - Press 'r' to toggle Acoustic Radar")
+    print(" Features:")
+    print("   - Neon Green Drivable Ground Grid")
+    print("   - Dedicated Cyan Stairway Detection")
+    print("   - Sleek High-Recall Survivor Skeleton Lock")
+    print("   - Acoustic Camera Sound Source Beam")
+    print(" Press 'q' key on the video window to stop.")
     print("=" * 70 + "\n")
 
     while cap.isOpened():
@@ -181,61 +193,44 @@ def run_mission_control(
             continue
 
         h, w = frame.shape[:2]
+        fx = w * 0.58  # Calibrated wide-angle focal length
 
-        # -------------------------------------------------------------
-        # STEP 1: Rubble Traversability Inference (RTX 4050 GPU)
-        # -------------------------------------------------------------
-        if show_traversability:
-            color_mask, costmap, t_seg = vision_engine.infer(frame)
-            blended = cv2.addWeighted(color_mask, alpha, frame, 1.0 - alpha, 0)
-        else:
-            blended = frame.copy()
-            costmap = np.zeros((h, w), dtype=np.uint8)
-            t_seg = 0.0
+        # 1. Rubble & Ground Grid Segmentation (RTX 4050)
+        annotated, costmap, t_seg = vision_engine.infer(frame)
 
-        # -------------------------------------------------------------
-        # STEP 2: Survivor Detection & Skeleton Lock (RTX 4050 GPU)
-        # -------------------------------------------------------------
-        if show_survivors:
-            blended, survivors, t_pose = survivor_detector.detect(blended)
-        else:
-            survivors = []
-            t_pose = 0.0
+        # 2. Sleek Survivor Keypoints & Distance (RTX 4050)
+        annotated, survivors, t_pose = survivor_detector.detect(annotated)
 
-        # -------------------------------------------------------------
-        # STEP 3: Acoustic Voice Direction Acquisition
-        # -------------------------------------------------------------
+        # 3. Acoustic DoA Target
         acoustic_target = audio_engine.get_target()
 
-        # -------------------------------------------------------------
-        # STEP 4: Autonomous Navigation Decision Loop
-        # -------------------------------------------------------------
+        # 4. Acoustic Camera Projection: Drop sound beacon on video pixel column!
+        render_acoustic_camera_beacon(annotated, acoustic_target, fx)
+
+        # 5. Nav2 Autopilot Instruction
         nav_cmd = navigator.compute_nav_command(survivors, acoustic_target, costmap)
 
-        # Timing & Framerate
+        # FPS
         total_gpu_time = t_seg + t_pose
         dt = time.perf_counter() - t0
         curr_fps = 1.0 / dt if dt > 0 else 30.0
         fps_smooth = 0.9 * fps_smooth + 0.1 * curr_fps
 
         # -------------------------------------------------------------
-        # HUD 1: Top Left Mission Telemetry Header
+        # HUD 1: Top Left Telemetry
         # -------------------------------------------------------------
-        header_w, header_h = 440, 85
-        cv2.rectangle(blended, (12, 12), (12 + header_w, 12 + header_h), (15, 15, 15), -1)
-        cv2.rectangle(blended, (12, 12), (12 + header_w, 12 + header_h), (50, 50, 50), 1)
+        cv2.rectangle(annotated, (12, 12), (430, 80), (15, 15, 15), -1)
+        cv2.rectangle(annotated, (12, 12), (430, 80), (50, 50, 50), 1)
 
-        cv2.putText(blended, "USAR AUTONOMOUS RESCUE MISSION CONTROL", (22, 32),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.48, (255, 255, 255), 1, cv2.LINE_AA)
-        cv2.putText(blended, "ACCELERATOR: NVIDIA RTX 4050 (DirectML Dual AI)", (22, 50),
+        cv2.putText(annotated, "USAR AUTONOMOUS RESCUE MISSION CONTROL", (22, 32),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.46, (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.putText(annotated, f"ACCELERATOR: {vision_engine.device_name} (Dual Model)", (22, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 180), 1, cv2.LINE_AA)
-        cv2.putText(blended, f"PIPELINE: {fps_smooth:.1f} FPS | DUAL GPU LATENCY: {total_gpu_time:.1f} ms", (22, 68),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, (220, 220, 220), 1, cv2.LINE_AA)
-        cv2.putText(blended, f"SURVIVORS: {len(survivors)} | AUDIO TARGET: {acoustic_target.status_text}", (22, 85),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.34, (0, 200, 255), 1, cv2.LINE_AA)
+        cv2.putText(annotated, f"FPS: {fps_smooth:.1f} | DUAL GPU LATENCY: {total_gpu_time:.1f} ms | SURVIVORS: {len(survivors)}", (22, 68),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.36, (220, 220, 220), 1, cv2.LINE_AA)
 
         # -------------------------------------------------------------
-        # HUD 2: Picture-in-Picture 1: Nav2 Metric Costmap (Top Right)
+        # HUD 2: Top Right - Nav2 Costmap (2D Grid)
         # -------------------------------------------------------------
         mini_w, mini_h = 160, 90
         mini_costmap = cv2.resize(costmap, (mini_w, mini_h), interpolation=cv2.INTER_NEAREST)
@@ -243,66 +238,42 @@ def run_mission_control(
 
         x_costmap = w - mini_w - 14
         y_costmap = 14
-        blended[y_costmap:y_costmap + mini_h, x_costmap:x_costmap + mini_w] = mini_bgr
-        cv2.rectangle(blended, (x_costmap, y_costmap), (x_costmap + mini_w, y_costmap + mini_h), (0, 255, 180), 1)
-        cv2.putText(blended, "Nav2 Costmap (2D)", (x_costmap + 6, y_costmap + 16),
+        annotated[y_costmap:y_costmap + mini_h, x_costmap:x_costmap + mini_w] = mini_bgr
+        cv2.rectangle(annotated, (x_costmap, y_costmap), (x_costmap + mini_w, y_costmap + mini_h), (0, 255, 180), 1)
+        cv2.putText(annotated, "Nav2 Costmap (2D)", (x_costmap + 6, y_costmap + 16),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 255, 180), 1, cv2.LINE_AA)
 
         # -------------------------------------------------------------
-        # HUD 3: Picture-in-Picture 2: Acoustic Sonar Radar (Bottom Right)
+        # HUD 3: Bottom Right - Tactical Acoustic Radar Compass
         # -------------------------------------------------------------
-        if show_radar:
-            radar_size = 180
-            radar_dial = render_acoustic_compass(acoustic_target, size=radar_size)
-            x_radar = w - radar_size - 14
-            y_radar = h - radar_size - 60  # Leave room above bottom nav bar
+        radar_size = 170
+        radar_dial = render_acoustic_compass(acoustic_target, size=radar_size)
+        x_radar = w - radar_size - 14
+        y_radar = h - radar_size - 55
 
-            # Alpha blend radar onto main viewport
-            radar_roi = blended[y_radar:y_radar + radar_size, x_radar:x_radar + radar_size]
-            blended[y_radar:y_radar + radar_size, x_radar:x_radar + radar_size] = cv2.addWeighted(radar_dial, 0.85, radar_roi, 0.15, 0)
-            cv2.rectangle(blended, (x_radar, y_radar), (x_radar + radar_size, y_radar + radar_size), (0, 255, 200), 1)
+        # Solid tactical overlay with border
+        annotated[y_radar:y_radar + radar_size, x_radar:x_radar + radar_size] = radar_dial
+        cv2.rectangle(annotated, (x_radar, y_radar), (x_radar + radar_size, y_radar + radar_size), (0, 255, 200), 1)
 
         # -------------------------------------------------------------
-        # HUD 4: Bottom Center Autonomous Navigation Command Bar
+        # HUD 4: Bottom Center - Autonomous Steering Dispatcher Bar
         # -------------------------------------------------------------
-        nav_bar_h = 42
-        nav_bar_y = h - nav_bar_h - 10
-        cv2.rectangle(blended, (12, nav_bar_y), (w - 12, nav_bar_y + nav_bar_h), (12, 12, 12), -1)
+        nav_h = 38
+        nav_y = h - nav_h - 8
+        cv2.rectangle(annotated, (12, nav_y), (w - 12, nav_y + nav_h), (12, 12, 12), -1)
 
-        # Border color changes based on navigation mode
-        if nav_cmd.mode == "VISUAL_SURVIVOR_LOCK":
-            border_col = (0, 255, 255)   # Yellow
-            mode_tag = "[SURVIVOR INTERCEPT]"
-        elif nav_cmd.mode == "RESCUE_STATIONARY":
-            border_col = (0, 0, 255)     # Red
-            mode_tag = "[TARGET REACHED]"
-        elif nav_cmd.mode == "ACOUSTIC_HOMING":
-            border_col = (0, 255, 120)   # Bright green
-            mode_tag = "[ACOUSTIC HOMING]"
-        else:
-            border_col = (100, 100, 100) # Neutral
-            mode_tag = "[AUTONOMOUS PATROL]"
+        border_col = (0, 255, 255) if nav_cmd.mode == "SURVIVOR_INTERCEPT" else (
+            (0, 255, 120) if nav_cmd.mode == "ACOUSTIC_HOMING" else (80, 80, 80)
+        )
+        cv2.rectangle(annotated, (12, nav_y), (w - 12, nav_y + nav_h), border_col, 2)
+        cv2.putText(annotated, f"NAV2 AUTOPILOT: {nav_cmd.action_text}",
+                    (24, nav_y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 255), 1, cv2.LINE_AA)
 
-        cv2.rectangle(blended, (12, nav_bar_y), (w - 12, nav_bar_y + nav_bar_h), border_col, 2)
+        cv2.imshow("USAR Autonomous Mission Control [RTX 4050]", annotated)
 
-        cv2.putText(blended, f"NAV2 AUTOPILOT {mode_tag}: {nav_cmd.action_text}",
-                    (24, nav_bar_y + 26), cv2.FONT_HERSHEY_SIMPLEX, 0.44, (255, 255, 255), 1, cv2.LINE_AA)
-
-        # -------------------------------------------------------------
-        # Render Composite HUD Frame
-        # -------------------------------------------------------------
-        cv2.imshow("USAR Autonomous Mission Control [NVIDIA RTX 4050]", blended)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord("q"):
-            print("Mission control stopped by operator.")
+        if cv2.waitKey(1) & 0xFF == ord("q"):
+            print("Mission control stopped by user.")
             break
-        elif key == ord("t"):
-            show_traversability = not show_traversability
-        elif key == ord("s"):
-            show_survivors = not show_survivors
-        elif key == ord("r"):
-            show_radar = not show_radar
 
     cap.release()
     audio_engine.stop()
@@ -311,11 +282,11 @@ def run_mission_control(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="USAR Autonomous Mission Control")
-    parser.add_argument("--url", type=str, default=None, help="Wireless Phone IP Webcam URL (e.g. http://172.21.131.53:8080)")
-    parser.add_argument("--webcam", type=int, default=0, help="Local Webcam device ID (default: 0)")
+    parser.add_argument("--url", type=str, default=None, help="Wireless Phone IP Webcam URL")
+    parser.add_argument("--webcam", type=int, default=0, help="Webcam device ID (default: 0)")
     parser.add_argument("--video", type=str, default=None, help="Path to video file")
-    parser.add_argument("--audio-url", type=str, default=None, help="Network audio URL (optional)")
-    parser.add_argument("--alpha", type=float, default=0.40, help="Traversability mask alpha (default: 0.40)")
+    parser.add_argument("--audio-url", type=str, default=None, help="Audio URL (optional)")
+    parser.add_argument("--alpha", type=float, default=0.35, help="Mask overlay alpha")
     args = parser.parse_args()
 
     v_src = args.url if args.url else (args.video if args.video else args.webcam)
